@@ -1,0 +1,17 @@
+# 个人配置和运行状态（每个人的都不一样，别人 fork 后应该从 config.example.json 复制）
+config.json
+latest_episodes.txt
+
+# 生成产物 / 大文件（都是本地跑出来的，不应该进版本库）
+models/
+audio/
+episodes/
+output/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code 本地设置
+.claude/

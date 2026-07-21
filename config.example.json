@@ -1,0 +1,13 @@
+{
+  "feeds": {
+    "example_show": "https://example.com/rss/your-podcast-feed.xml"
+  },
+  "whisper_model_size": "large-v3",
+  "translation": {
+    "provider_name": "DeepSeek",
+    "base_url": "https://api.deepseek.com",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "model": "deepseek-v4-flash",
+    "extra_system_prompt": ""
+  }
+}
