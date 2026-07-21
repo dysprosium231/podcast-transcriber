@@ -288,21 +288,19 @@ class SpinnerProgress:
     """常驻悬浮窗，用一个转动的圆环表示"正在处理但没有具体进度可展示"的阶段
     （模型加载、逐个节目的RSS检查），一直转到真正开始下载才关闭。
 
-    这段过程里既有模型加载又有网络请求，全是阻塞调用，主线程没空自己去pump tk的事件循环，
-    动画会卡死；所以这个窗口的创建/动画/销毁整个生命周期都放在独立线程里跑自己的mainloop，
-    主线程只通过线程安全的简单信号（Event + 字符串引用赋值）来更新文字、触发关闭，
-    不直接碰任何tk对象——tk的窗口/控件必须只由创建它们的那个线程访问。"""
+    tk的窗口/控件必须只由创建它们的那个线程访问——早期版本让这个窗口自己在独立线程里
+    开一个Tk()、跑自己的mainloop，而主线程后面又会创建FloatingProgress的Tk()，两边分属
+    不同线程但同属一个进程，真实运行时会随机触发"Tcl_AsyncDelete: async handler deleted
+    by the wrong thread"直接把整个进程崩掉（不是退出时才崩，运行期间随时可能发生，
+    实测过哪怕整个下载/转录/翻译流程全部成功，也会在最后收尾阶段冒出这个崩溃）。
+
+    改成这个类本身的Tk窗口和事件循环（mainloop）留在调用者所在的线程——也就是main()的
+    主线程，跟脚本里其他所有Tk对象（FloatingProgress）保持同一个线程。真正阻塞的工作
+    （模型加载、RSS请求）通过 run_with_work() 放到后台线程去跑，主线程只负责跑tk事件
+    循环、驱动转圈动画，直到后台线程干完活。work_fn内部可以调用 spinner.set_stage(text)
+    更新文字（线程安全，只是设置一个普通属性，不碰tk对象）。"""
 
     def __init__(self, title):
-        self._title = title
-        self._pending_stage = "准备中..."
-        self._stop_event = threading.Event()
-        self._ready_event = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        self._ready_event.wait(timeout=5)
-
-    def _run(self):
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -343,7 +341,7 @@ class SpinnerProgress:
         cy = int(44 * scale)
 
         avail_w = width - pad * 2
-        display_title = self._title
+        display_title = title
         if title_font.measure(display_title) > avail_w:
             while len(display_title) > 1 and title_font.measure(display_title + "…") > avail_w:
                 display_title = display_title[:-1]
@@ -353,6 +351,7 @@ class SpinnerProgress:
             pad, int(16 * scale), text=display_title, anchor="w",
             font=title_font, fill=FloatingProgress.FG_TITLE,
         )
+        self._pending_stage = "准备中..."
         self.stage_item = self.canvas.create_text(
             pad, int(44 * scale), text=self._pending_stage, anchor="w",
             font=stage_font, fill=FloatingProgress.FG_STAGE,
@@ -366,16 +365,14 @@ class SpinnerProgress:
 
         self._angle = 0
         self._last_shown_stage = None
-        self._ready_event.set()
-        self._tick()
-        self.root.mainloop()
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
+        self._done = False
+        self.root.update()
+
+    def set_stage(self, text):
+        self._pending_stage = text
 
     def _tick(self):
-        if self._stop_event.is_set():
+        if self._done:
             self.root.quit()
             return
         try:
@@ -389,14 +386,32 @@ class SpinnerProgress:
             return
         self.root.after(50, self._tick)
 
-    def set_stage(self, text):
-        self._pending_stage = text
+    def run_with_work(self, work_fn):
+        """在后台线程跑 work_fn()（无参数），当前线程留在这里跑tk事件循环驱动动画，
+        直到 work_fn 结束才返回；work_fn 的返回值会被原样返回，它抛出的异常会在这里
+        重新抛出（跨线程转发）。跑完（不管成功失败）这个悬浮窗都会被销毁。"""
+        result = {"value": None, "error": None}
 
-    def close(self):
-        if self._stop_event.is_set():
-            return
-        self._stop_event.set()
-        self._thread.join(timeout=3)
+        def runner():
+            try:
+                result["value"] = work_fn()
+            except Exception as e:
+                result["error"] = e
+            finally:
+                self._done = True
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        self._tick()
+        self.root.mainloop()
+        thread.join()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        if result["error"] is not None:
+            raise result["error"]
+        return result["value"]
 
 
 # ==================== 工具函数 ====================
@@ -678,6 +693,56 @@ audio.addEventListener("timeupdate", () => {
         f.write(html_content)
 
 
+def _check_show(show_name, rss_url, latest_log):
+    """检查一个节目的RSS，没有新一期就返回None，有的话返回这一集待处理的信息。"""
+    show_dir = os.path.join(EPISODES_DIR, show_name)
+    os.makedirs(show_dir, exist_ok=True)
+
+    try:
+        newest = get_newest_episode(rss_url)
+    except Exception as e:
+        print(f"RSS parse failed: {e}")
+        notify_simple(f"「{show_name}」抓取失败", f"RSS解析出错: {e}"[:100])
+        return None
+
+    if newest is None:
+        print("RSS empty, skipping")
+        return None
+
+    current_title = newest.title
+    recorded_title = latest_log.get(show_name)
+
+    if current_title == recorded_title:
+        print(f"No update, latest is still: {current_title}")
+        notify_simple(f"「{show_name}」检查完成", f"暂无新一期，最新仍是：{current_title[:50]}")
+        return None
+
+    print(f"New episode found: {current_title}")
+    notify_simple(f"「{show_name}」发现新一期", f"{current_title[:60]}，开始下载和处理")
+
+    if not newest.enclosures:
+        print("No audio link, skipping")
+        return None
+    audio_url = newest.enclosures[0].href
+
+    safe_title = sanitize_filename(current_title)
+    episode_dir = os.path.join(show_dir, safe_title)
+    os.makedirs(episode_dir, exist_ok=True)
+
+    return {
+        "audio_url": audio_url,
+        "current_title": current_title,
+        "episode_dir": episode_dir,
+    }
+
+
+def _load_model():
+    """加载GPU模型，返回(model, batched_model)。跑在后台线程（配合spinner.run_with_work）。"""
+    model = WhisperModel(MODEL_PATH, device="cuda", compute_type="float16")
+    batched_model = BatchedInferencePipeline(model=model)
+    return model, batched_model
+
+
 # ==================== 主流程 ====================
 def main():
     print(f"=== RUN START {datetime.now()} ===")
@@ -685,53 +750,33 @@ def main():
     wait_if_fullscreen_active()
 
     latest_log = load_latest_log()
-
-    spinner = SpinnerProgress("播客自动化")
+    os.makedirs(EPISODES_DIR, exist_ok=True)
 
     # 模型懒加载：只有真正确认有新一期要转录时才加载（只加载一次，供后续节目复用），
     # 这样"今天两个节目都没更新"的最常见情况就不用白等1-2分钟的GPU模型加载
     model = None
     batched_model = None
 
-    os.makedirs(EPISODES_DIR, exist_ok=True)
-
     for show_name, rss_url in FEEDS.items():
         print(f"\n--- Checking {show_name} ---")
-        spinner.set_stage(f"正在检查「{show_name}」...")
 
-        show_dir = os.path.join(EPISODES_DIR, show_name)
-        os.makedirs(show_dir, exist_ok=True)
-
-        try:
-            newest = get_newest_episode(rss_url)
-        except Exception as e:
-            print(f"RSS parse failed: {e}")
-            notify_simple(f"「{show_name}」抓取失败", f"RSS解析出错: {e}"[:100])
+        job = _check_show(show_name, rss_url, latest_log)
+        if job is None:
             continue
 
-        if newest is None:
-            print("RSS empty, skipping")
-            continue
+        if model is None:
+            spinner = SpinnerProgress("播客自动化")
+            spinner.set_stage("正在加载GPU模型（首次可能需要1-2分钟）...")
+            try:
+                model, batched_model = spinner.run_with_work(_load_model)
+            except Exception as e:
+                print(f"Model loading failed: {e}")
+                notify_simple("播客自动化启动失败", f"GPU模型加载失败: {e}"[:100])
+                return
 
-        current_title = newest.title
-        recorded_title = latest_log.get(show_name)
-
-        if current_title == recorded_title:
-            print(f"No update, latest is still: {current_title}")
-            notify_simple(f"「{show_name}」检查完成", f"暂无新一期，最新仍是：{current_title[:50]}")
-            continue
-
-        print(f"New episode found: {current_title}")
-        notify_simple(f"「{show_name}」发现新一期", f"{current_title[:60]}，开始下载和处理")
-
-        if not newest.enclosures:
-            print("No audio link, skipping")
-            continue
-        audio_url = newest.enclosures[0].href
-
-        safe_title = sanitize_filename(current_title)
-        episode_dir = os.path.join(show_dir, safe_title)
-        os.makedirs(episode_dir, exist_ok=True)
+        current_title = job["current_title"]
+        audio_url = job["audio_url"]
+        episode_dir = job["episode_dir"]
 
         audio_filename = "audio.mp3"
         audio_path = os.path.join(episode_dir, audio_filename)
@@ -740,18 +785,6 @@ def main():
         en_txt_path = os.path.join(episode_dir, "transcript_en.txt")
         zh_txt_path = os.path.join(episode_dir, "transcript_zh.txt")
 
-        if model is None:
-            spinner.set_stage("正在加载GPU模型（首次可能需要1-2分钟）...")
-            try:
-                model = WhisperModel(MODEL_PATH, device="cuda", compute_type="float16")
-                batched_model = BatchedInferencePipeline(model=model)
-            except Exception as e:
-                spinner.close()
-                print(f"Model loading failed: {e}")
-                notify_simple("播客自动化启动失败", f"GPU模型加载失败: {e}"[:100])
-                return
-
-        spinner.close()  # 真正开始下载了，转圈悬浮窗到此为止，交给下面有具体进度的悬浮窗
         progress = FloatingProgress(f"「{show_name}」{current_title}")
 
         try:
@@ -792,8 +825,6 @@ def main():
             progress.finish(f"处理失败: {e}"[:60])
             notify_simple(f"「{show_name}」处理失败", f"{current_title[:40]}：{e}"[:100])
             continue
-
-    spinner.close()  # 兜底：如果所有节目都没有新一期，转圈窗口不会在循环里被关掉，这里收尾
 
     print(f"\n=== RUN END {datetime.now()} ===")
 
