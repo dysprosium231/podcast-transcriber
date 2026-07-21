@@ -16,19 +16,40 @@
 
 不管你打算用命令行还是图形界面，转录/翻译本身都需要一个装好依赖的 Python 环境——**图形界面只是操作面板，真正干活的还是这一步装的环境**。
 
-1. 克隆本仓库，装依赖（建议用 conda 单独建一个环境，跟系统 Python 隔开）：
+1. 装 [Miniconda](https://docs.conda.io/en/latest/miniconda.html)（推荐用 conda，理由见下面的提示框），建一个专用环境：
+
+   ```bat
+   conda create -n whisper-env python=3.11
+   conda activate whisper-env
+   ```
+
+2. **装好 CUDA 运行库**——这一步很容易被忽略，但没它转录会直接报错崩溃。`pip install faster-whisper` 并不会带上它依赖的 cuBLAS / cuDNN 这些 CUDA 运行库，必须单独装：
+
+   ```bat
+   conda install -c conda-forge cudnn libcublas cuda-nvrtc
+   ```
+
+3. 克隆本仓库，装 Python 依赖：
 
    ```bat
    pip install -r requirements.txt
    ```
 
-2. 复制配置模板：
+4. 复制配置模板：
 
    ```bat
    copy config.example.json config.json
    ```
 
-3. Whisper 转录模型不需要手动下载，第一次用的时候会自动从 Hugging Face 下载好并缓存（下一步图形界面里也能手动点下载、看进度）。显卡显存不够的话可以换小一点的模型（`medium`、`small`、`base.en` 等），第4步里选。
+5. Whisper 转录模型不需要手动下载，第一次用的时候会自动从 Hugging Face 下载好并缓存（下一步图形界面里也能手动点下载、看进度）。显卡显存不够的话可以换小一点的模型（`medium`、`small`、`base.en` 等），第4步里选。
+
+> **为什么推荐 conda 而不是纯 pip venv**：CUDA 运行库在 Windows 上不好装——完整装 NVIDIA CUDA Toolkit 版本要跟 ctranslate2（faster-whisper 的推理引擎）编译时用的版本精确匹配，很容易踩坑；conda-forge 把这些库打成了普通 conda 包，装起来跟装其他 Python 包没区别，版本也管理得比较省心。如果你不想用 conda，也可以试试 pip 装 `nvidia-cublas-cu12`、`nvidia-cudnn-cu12` 这类官方 CUDA 轮子，但没有像 conda 这条路验证得那么充分。
+
+> **遇到 `cublas64_12.dll` / `cudnn64_9.dll` 之类"找不到 xxx.dll"的报错**：说明 CUDA 运行库没装好或者版本不匹配，回到第2步重新确认。可以用下面这行快速自检（在装好依赖的环境里跑，不报错就说明能找到）：
+>
+> ```bat
+> python -c "import ctypes; ctypes.WinDLL('cublas64_12.dll'); print('OK')"
+> ```
 
 ### 第3步：打开图形界面
 
