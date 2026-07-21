@@ -21,66 +21,82 @@
 
 ## 安装
 
+不管走哪条路，**真正跑转录/翻译的 Python 环境（第0步）都是必须的**——它是每天定时任务、以及手动处理功能实际干活的地方。区别只在于"配置这个项目"这一步，你是想编辑 JSON/敲命令，还是想用图形界面点一点。
+
+### 第0步：装好 Python 环境（两条路都需要）
+
 1. 克隆本仓库，装依赖：
 
    ```bat
    pip install -r requirements.txt
    ```
 
-2. Whisper 模型不需要手动下载——第一次运行时会根据 `config.json` 里的 `whisper_model_size` 自动从 Hugging Face 下载对应的 faster-whisper 模型并缓存，等着就行。显卡显存不够的话可以在配置里换小一点的模型（`medium`、`small`、`base.en` 等）。
+   （建议用 conda 单独建一个环境，跟系统 Python 隔开）
+
+2. Whisper 模型不需要手动下载——第一次运行时会根据 `config.json` 里的 `whisper_model_size` 自动从 Hugging Face 下载对应的 faster-whisper 模型并缓存，等着就行。显卡显存不够的话可以换小一点的模型（`medium`、`small`、`base.en` 等）。
 
    如果你想手动指定模型文件（比如离线环境、或者已经下载好了别的来源的模型），把模型文件夹放到 `models/<模型名>/` 下面（需要包含 `model.bin`、`config.json`、`tokenizer.json`、`vocabulary.json` 等文件），程序会优先用本地文件夹，不会再走自动下载。
 
-3. 复制配置模板并按需修改：
+3. 复制配置模板：
 
    ```bat
    copy config.example.json config.json
    ```
 
-   编辑 `config.json`（见下方「配置说明」），或者用图形界面代替手动改 JSON + 设环境变量：
+装好之后，接下来配置这个项目（订阅哪些播客、用哪个翻译服务商、每天几点跑）有两种方式，任选一种即可。
 
-   ```bat
-   python setup_wizard.py
-   ```
+### 方式一：直接用源码 / 命令行
 
-   或者不装 Python 也能用：去 [Releases](../../releases) 页面下载打包好的 `podcast-manager.exe`（体积大概36MB），放在项目根目录（跟 `config.json`、`episodes/` 同一层）双击直接打开。这个界面本身很轻量（只有tkinter+网络请求），**不直接跑转录/翻译**——那部分工作交给「设置」页里指定的真实Python环境（比如 `run_daily.bat` 用的那个conda环境）以子进程方式执行，所以界面启动快、体积小，也不存在"exe里缺CUDA库"这种问题。首次打开exe时Windows可能会先做一次安全扫描，等个几秒到几十秒，之后再打开就快了（几秒钟）。
+编辑 `config.json`（字段说明见下方「配置说明」），然后：
 
-   界面分三个页签：
-   - **播客库**：浏览 `episodes/` 下已经生成的节目，双击（或选中后点按钮）直接打开某一期的字幕页 / 播放音频 / 打开所在文件夹，不用自己去文件资源管理器里翻
-   - **手动处理**：daily_podcast.py 正常运行只抓每个节目最新的一期，这里补三种"不是靠自动抓取"的路子，产出格式都跟自动生成的完全一样：
-     - **单个文件**：选一个本地音频、填节目名和标题，直接转录+翻译
-     - **RSS历史下载**：把某个节目（或临时粘贴一个不在订阅列表里的RSS地址）的完整历史列出来，勾选任意几期批量下载+处理，不再局限于"只能拿到最新一期"
-     - **批量本地导入**：选一个文件夹或zip压缩包，里面一堆mp3/m4a/wav等音频（比如非RSS渠道拿到的本地播客归档），逐个建文件夹处理，标题默认取文件名
-     
-     批量场景（RSS历史/本地导入）选中多项会排队顺序处理（GPU转录本来就没法并行），可以随时点「取消剩余排队项」；已经处理过的期数重新选中会在开始前一次性弹窗询问是否覆盖，不会一项项打断。
-   - **设置**：添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义，也可以直接输入自定义服务商名称）、填 API Key、选 Whisper 模型大小并点按钮下载（带进度条）、指定"运行环境"（真实Python解释器路径，留空会自动从 `run_daily.bat` 里探测）、设置每天几点自动运行并一键创建/更新 Windows 计划任务（可以勾选/取消勾选来启用或禁用）。保存后自动生成 `config.json`，API Key 写入 Windows 环境变量，界面内容始终和 `config.json` 保持同步（切页签、点「重新加载」都会重新按文件内容刷新）
+```bat
+setx DEEPSEEK_API_KEY "你的key"
+```
 
-   自己重新打包 exe：`pip install pyinstaller` 之后跑
+（环境变量名对应 `config.json` 里的 `translation.api_key_env`，默认是 `DEEPSEEK_API_KEY`，换了服务商就改成对应的名字）
 
-   ```bat
-   pyinstaller --onefile --windowed --name podcast-manager setup_wizard.py ^
-     --add-binary "<conda环境>\Library\bin\tcl86t.dll;." ^
-     --add-binary "<conda环境>\Library\bin\tk86t.dll;." ^
-     --add-binary "<conda环境>\Library\bin\liblzma.dll;." ^
-     --add-binary "<conda环境>\Library\bin\libbz2.dll;." ^
-     --add-binary "<conda环境>\Library\bin\ffi.dll;." ^
-     --add-binary "<conda环境>\Library\bin\libexpat.dll;." ^
-     --add-binary "<conda环境>\Library\bin\sqlite3.dll;."
-   ```
+先手动跑一次确认没问题：
 
-   这几个 `--add-binary` 是因为 conda 环境的 tcl/tk 等运行时 DLL 不在 PyInstaller 默认能找到的位置，不加的话打包出来的 exe 在没装 conda 的机器上会因为缺 DLL 打不开。
+```bat
+python daily_podcast.py
+```
 
-4. 如果没用上面的向导，手动设置翻译服务的 API Key 环境变量（默认是 `DEEPSEEK_API_KEY`，具体看你 `config.json` 里的 `translation.api_key_env`）：
+计划任务的设置方式见下方「设置每日自动运行」。
 
-   ```bat
-   setx DEEPSEEK_API_KEY "你的key"
-   ```
+### 方式二：用图形界面（不想编辑JSON/敲命令的话）
 
-5. 先手动跑一次确认没问题：
+```bat
+python setup_wizard.py
+```
 
-   ```bat
-   python daily_podcast.py
-   ```
+或者不想在命令行里跑，用打包好的独立 exe：去 [Releases](../../releases) 页面下载 `podcast-manager.exe`（体积大概36MB），放在项目根目录（跟 `config.json`、`episodes/` 同一层）双击直接打开。
+
+**注意**：这个 exe 只是图形化的配置/管理界面，本身很轻量（只有tkinter+网络请求），**不直接跑转录/翻译**——那部分工作交给第0步装好的真实Python环境以子进程方式执行，所以它不能替代第0步，只是让"配置"这一步不用碰命令行。好处是启动快、体积小，也不存在"exe里缺CUDA库"这种问题。首次打开exe时Windows可能会先做一次安全扫描，等个几秒到几十秒，之后再打开就快了（几秒钟）。
+
+不管是 `python setup_wizard.py` 还是 `podcast-manager.exe`，界面都分三个页签：
+- **播客库**：浏览 `episodes/` 下已经生成的节目，双击（或选中后点按钮）直接打开某一期的字幕页 / 播放音频 / 打开所在文件夹，不用自己去文件资源管理器里翻
+- **手动处理**：daily_podcast.py 正常运行只抓每个节目最新的一期，这里补三种"不是靠自动抓取"的路子，产出格式都跟自动生成的完全一样：
+  - **单个文件**：选一个本地音频、填节目名和标题，直接转录+翻译
+  - **RSS历史下载**：把某个节目（或临时粘贴一个不在订阅列表里的RSS地址）的完整历史列出来，勾选任意几期批量下载+处理，不再局限于"只能拿到最新一期"
+  - **批量本地导入**：选一个文件夹或zip压缩包，里面一堆mp3/m4a/wav等音频（比如非RSS渠道拿到的本地播客归档），逐个建文件夹处理，标题默认取文件名
+  
+  批量场景（RSS历史/本地导入）选中多项会排队顺序处理（GPU转录本来就没法并行），可以随时点「取消剩余排队项」；已经处理过的期数重新选中会在开始前一次性弹窗询问是否覆盖，不会一项项打断。
+- **设置**：添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义，也可以直接输入自定义服务商名称）、填 API Key、选 Whisper 模型大小并点按钮下载（带进度条）、指定"运行环境"（真实Python解释器路径，留空会自动从 `run_daily.bat` 里探测）、设置每天几点自动运行并一键创建/更新 Windows 计划任务（可以勾选/取消勾选来启用或禁用）。保存后自动生成 `config.json`，API Key 写入 Windows 环境变量，界面内容始终和 `config.json` 保持同步（切页签、点「重新加载」都会重新按文件内容刷新）
+
+自己重新打包 exe：`pip install pyinstaller` 之后跑
+
+```bat
+pyinstaller --onefile --windowed --name podcast-manager setup_wizard.py ^
+  --add-binary "<conda环境>\Library\bin\tcl86t.dll;." ^
+  --add-binary "<conda环境>\Library\bin\tk86t.dll;." ^
+  --add-binary "<conda环境>\Library\bin\liblzma.dll;." ^
+  --add-binary "<conda环境>\Library\bin\libbz2.dll;." ^
+  --add-binary "<conda环境>\Library\bin\ffi.dll;." ^
+  --add-binary "<conda环境>\Library\bin\libexpat.dll;." ^
+  --add-binary "<conda环境>\Library\bin\sqlite3.dll;."
+```
+
+这几个 `--add-binary` 是因为 conda 环境的 tcl/tk 等运行时 DLL 不在 PyInstaller 默认能找到的位置，不加的话打包出来的 exe 会因为缺 DLL 打不开界面。
 
 ## 配置说明（`config.json`）
 
