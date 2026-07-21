@@ -357,9 +357,38 @@ class SetupWizard:
     也会重新读一次文件回填——不是假设写成功了就直接照抄内存里的值，而是真的按落盘后的文件为准。
     """
 
-    def __init__(self, parent):
-        self.parent = parent
+    def __init__(self, container):
+        # 这一页内容叠起来（订阅列表+翻译+模型+运行环境+计划任务+按钮）比其它两个页签高得多，
+        # 在分辨率矮一点或者DPI缩放大一点的屏幕上会超出主窗口固定的高度（App.__init__里
+        # resizable(False, False)，不能拖大也不会自动换算），底部的「保存配置」按钮会被
+        # 挤到屏幕外面，鼠标点不到——套一层Canvas+Scrollbar滚动区域，所有_build_*方法
+        # 照旧把内容放进self.parent，只是self.parent现在指向Canvas里的内层Frame，
+        # 而不是Notebook那个tab本身
         self.download_state = DownloadState()
+
+        canvas = tk.Canvas(container, bg=COLORS["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.parent = ttk.Frame(canvas)
+        inner_window = canvas.create_window((0, 0), window=self.parent, anchor="nw")
+
+        def _sync_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_inner_width(event):
+            canvas.itemconfig(inner_window, width=event.width)
+
+        self.parent.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _sync_inner_width)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
 
         self._build_feeds_section()
         self._build_translation_section()
@@ -578,6 +607,7 @@ class SetupWizard:
                 "「手动处理」页签的转录/翻译不在这个界面自己的进程里跑，而是把任务交给这里指定的"
                 "Python解释器（装了faster-whisper等依赖的那个环境，比如conda环境里的python.exe）"
                 "当独立子进程执行。留空的话会尝试自动从 run_daily.bat 里读取。"
+                "「保存配置」会同步把这个路径写进 run_daily.bat（每日自动运行实际用的就是它）。"
             ),
         ).pack(anchor="w", padx=10, pady=(0, 10))
 
@@ -752,6 +782,8 @@ class SetupWizard:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
 
+        sync_run_daily_bat_conda_env(config["python_exe"])
+
         api_key = self.api_key_var.get().strip()
         msg = "config.json 已保存。"
         if api_key:
@@ -923,6 +955,35 @@ def find_python_exe(prefer_config=True):
         return sys.executable  # 用 python setup_wizard.py 运行时，自己就在正确的环境里
 
     return None
+
+
+def sync_run_daily_bat_conda_env(python_exe):
+    """把run_daily.bat里的CONDA_ENV同步成python_exe所在目录。
+
+    「应用定时任务设置」只负责建/改schtasks任务本身，实际每天触发时真正执行的
+    run_daily.bat读的是它自己文件里硬编码的CONDA_ENV，跟GUI这边配置的python_exe
+    完全是两回事——不同步的话，新用户走完整个设置向导、「手动处理」测试也一切正常
+    （那条路径靠find_python_exe的兜底逻辑，能兜到当前正在运行GUI的这个解释器），
+    但每天真正自动触发时run_daily.bat仍然用着仓库里带的旧路径，静默失败且没有任何
+    界面提示。这里在保存配置时顺手把CONDA_ENV同步过去，两边保持一致。
+
+    只在python_exe非空时才动手——不知道该同步成什么就不猜，宁可保持原样。
+    读写失败（文件被占用、没权限之类）静默跳过，不应该因为这个阻断保存配置。"""
+    if not python_exe or not os.path.exists(RUN_DAILY_BAT_PATH):
+        return
+    conda_env = os.path.dirname(python_exe)
+    try:
+        with open(RUN_DAILY_BAT_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+        new_content, count = re.subn(
+            r"(set\s+CONDA_ENV=).+", lambda m: m.group(1) + conda_env, content,
+            count=1, flags=re.IGNORECASE,
+        )
+        if count:
+            with open(RUN_DAILY_BAT_PATH, "w", encoding="utf-8") as f:
+                f.write(new_content)
+    except Exception:
+        pass
 
 
 def build_subprocess_env(python_exe):
