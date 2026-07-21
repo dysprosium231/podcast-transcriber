@@ -43,11 +43,12 @@
    python setup_wizard.py
    ```
 
-   或者不装 Python 也能用：去 [Releases](../../releases) 页面下载打包好的 `podcast-manager.exe`，放在项目根目录（跟 `config.json`、`episodes/` 同一层）双击直接打开（这个 exe 只是管理界面，真正跑转录/翻译的 `daily_podcast.py` 还是需要上面装好的 Python 环境）。
+   或者不装 Python 也能用：去 [Releases](../../releases) 页面下载打包好的 `podcast-manager.exe`（体积大概100MB，打包了转录/翻译要用到的库），放在项目根目录（跟 `config.json`、`episodes/` 同一层）双击直接打开。
 
-   界面分两个页签：
+   界面分三个页签：
    - **播客库**：浏览 `episodes/` 下已经生成的节目，双击（或选中后点按钮）直接打开某一期的字幕页 / 播放音频 / 打开所在文件夹，不用自己去文件资源管理器里翻
-   - **设置**：添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义）、填 API Key、选 Whisper 模型大小并点按钮下载（带进度条）、设置每天几点自动运行并一键创建/更新 Windows 计划任务。保存后自动生成 `config.json`，API Key 写入 Windows 环境变量
+   - **手动处理**：不是从RSS订阅来的音频也能处理——选一个本地音频文件、填节目名和标题，点一下就走同一套转录+翻译流程，产出格式跟自动生成的完全一样。**注意**：独立exe版本没有打包 CUDA 运行库（cublas/cudnn 加起来有1.7GB，打包不现实），这个功能在独立exe下需要电脑上本来就有能被系统找到的CUDA环境才能跑GPU转录；更省心的做法是用 `python setup_wizard.py` 在项目自带的conda环境里运行，不受这个限制
+   - **设置**：添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义，也可以直接输入自定义服务商名称）、填 API Key、选 Whisper 模型大小并点按钮下载（带进度条）、设置每天几点自动运行并一键创建/更新 Windows 计划任务（可以勾选/取消勾选来启用或禁用）。保存后自动生成 `config.json`，API Key 写入 Windows 环境变量，界面内容始终和 `config.json` 保持同步（切页签、点「重新加载」都会重新按文件内容刷新）
 
    自己重新打包 exe：`pip install pyinstaller` 之后跑
 

@@ -11,10 +11,11 @@ import os
 import sys
 import json
 import ctypes
+import shutil
 import subprocess
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from tqdm import tqdm
 
 # 界面文字发糊是没做DPI感知，Windows会用位图整体拉伸缩放窗口来适配系统缩放比例；
@@ -180,6 +181,35 @@ def style_text_widget(widget):
         relief="flat", borderwidth=1,
         highlightbackground=COLORS["border"], highlightcolor=COLORS["accent"], highlightthickness=1,
     )
+
+
+def make_checkmark_toggle(parent, text, variable, command=None):
+    """clam主题下ttk.Checkbutton画的是纯色方块，不是真正的对勾；用☑/☐字符自己实现一个
+    看起来像"打勾"的开关，点文字或者方块都能切换"""
+    frame = ttk.Frame(parent)
+
+    def render():
+        checked = variable.get()
+        box.config(
+            text="☑" if checked else "☐",
+            fg=COLORS["accent"] if checked else COLORS["fg_muted"],
+        )
+
+    def on_click(_event=None):
+        variable.set(not variable.get())
+        render()
+        if command:
+            command()
+
+    box = tk.Label(frame, font=("Segoe UI", 12), bg=COLORS["bg"], cursor="hand2")
+    box.pack(side="left")
+    label = tk.Label(frame, text=text, bg=COLORS["bg"], fg=COLORS["fg"], font=("Segoe UI", 9), cursor="hand2")
+    label.pack(side="left", padx=(4, 0))
+
+    box.bind("<Button-1>", on_click)
+    label.bind("<Button-1>", on_click)
+    render()
+    return frame
 
 
 def load_existing_config():
@@ -402,10 +432,13 @@ class SetupWizard:
         self.preset_var = tk.StringVar(value="DeepSeek")
         preset_combo = ttk.Combobox(
             preset_row, textvariable=self.preset_var,
-            values=list(TRANSLATION_PRESETS.keys()), state="readonly", width=20,
+            values=list(TRANSLATION_PRESETS.keys()), width=20,
         )
         preset_combo.pack(side="left", padx=(4, 0))
         preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
+        ttk.Label(
+            preset_row, style="Muted.TLabel", text="（也可以直接输入自定义服务商名称）",
+        ).pack(side="left", padx=(6, 0))
 
         grid = ttk.Frame(frame)
         grid.pack(fill="x", padx=10, pady=(4, 8))
@@ -428,8 +461,8 @@ class SetupWizard:
         self.api_key_entry = ttk.Entry(grid, textvariable=self.api_key_var, width=45, show="*")
         self.api_key_entry.grid(row=3, column=1, sticky="w")
         self.show_key_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            grid, text="显示", variable=self.show_key_var, command=self._toggle_key_visibility,
+        make_checkmark_toggle(
+            grid, "显示", self.show_key_var, command=self._toggle_key_visibility,
         ).grid(row=3, column=2, padx=(6, 0))
 
         ttk.Label(
@@ -521,8 +554,8 @@ class SetupWizard:
         enable_row = ttk.Frame(frame)
         enable_row.pack(fill="x", padx=10, pady=(10, 4))
         self.schedule_enabled_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            enable_row, text="启用每日自动运行", variable=self.schedule_enabled_var,
+        make_checkmark_toggle(
+            enable_row, "启用每日自动运行", self.schedule_enabled_var,
             command=self._on_schedule_enabled_toggle,
         ).pack(side="left")
 
@@ -800,27 +833,246 @@ class HomeTab:
             os.startfile(path)
 
 
+AUDIO_FILE_TYPES = [
+    ("音频文件", "*.mp3 *.m4a *.wav *.flac *.aac *.ogg *.wma"),
+    ("所有文件", "*.*"),
+]
+
+# 手动处理跟每天自动跑的daily_podcast.py共用同一套转录/翻译逻辑（不重新写一遍，靠导入复用），
+# 模型在同一次程序运行里只加载一次，重复处理多个音频不用每次都等GPU模型重新加载
+_manual_model = None
+_manual_batched_model = None
+
+
+class ManualState:
+    """手动处理线程和GUI主线程之间只通过这几个简单字段传递状态（不直接跨线程碰tk控件）"""
+
+    def __init__(self):
+        self.running = False
+        self.stage = ""
+        self.progress = 0.0
+        self.done = False
+        self.error = None
+        self.result_dir = None
+
+
+def start_manual_processing(audio_src_path, show_name, episode_title, state):
+    state.running = True
+    state.progress = 0.0
+    state.stage = "准备中..."
+    state.done = False
+    state.error = None
+    state.result_dir = None
+
+    def on_transcribe_progress(p):
+        state.progress = p * 0.6
+        state.stage = f"转录中 {int(p * 100)}%"
+
+    def on_translate_progress(p):
+        state.progress = 0.6 + p * 0.4
+        state.stage = f"翻译中 {int(p * 100)}%"
+
+    def worker():
+        global _manual_model, _manual_batched_model
+        try:
+            import daily_podcast as dp
+        except FileNotFoundError:
+            state.error = "找不到 config.json，请先在「设置」页保存一次配置"
+            state.running = False
+            return
+        except Exception as e:
+            state.error = f"加载主程序模块失败：{e}"
+            state.running = False
+            return
+
+        try:
+            show_dir = os.path.join(EPISODES_DIR, show_name)
+            os.makedirs(show_dir, exist_ok=True)
+            safe_title = dp.sanitize_filename(episode_title)
+            episode_dir = os.path.join(show_dir, safe_title)
+            os.makedirs(episode_dir, exist_ok=True)
+
+            ext = os.path.splitext(audio_src_path)[1] or ".mp3"
+            audio_filename = f"audio{ext}"
+            audio_dest = os.path.join(episode_dir, audio_filename)
+
+            state.stage = "复制音频文件..."
+            shutil.copyfile(audio_src_path, audio_dest)
+
+            if _manual_model is None:
+                state.stage = "正在加载GPU模型（首次可能需要1-2分钟）..."
+                try:
+                    _manual_model = dp.WhisperModel(dp.MODEL_PATH, device="cuda", compute_type="float16")
+                    _manual_batched_model = dp.BatchedInferencePipeline(model=_manual_model)
+                except Exception as e:
+                    if getattr(sys, "frozen", False) and ("dll" in str(e).lower() or "cublas" in str(e).lower() or "cudnn" in str(e).lower()):
+                        # 打包成exe之后不会带CUDA运行库（cublas/cudnn加起来有1.7GB，打包不现实），
+                        # 手动处理这个功能在独立exe下需要电脑上本来就有能被找到的CUDA运行环境；
+                        # 用 python setup_wizard.py 在项目自带的conda环境里跑就没有这个限制
+                        raise RuntimeError(
+                            "GPU模型加载失败，缺少CUDA运行库（cublas/cudnn等）。"
+                            "这是独立exe的已知限制——这些库总共1.7GB左右，没有打包进exe。"
+                            "「手动处理」这个功能建议用 `python setup_wizard.py` 在装好conda环境的电脑上运行，"
+                            f"不受这个限制。\n\n原始错误：{e}"
+                        ) from e
+                    raise
+
+            state.stage = "转录中（GPU运算）..."
+            segments = dp.transcribe_audio(_manual_batched_model, audio_dest, on_progress=on_transcribe_progress)
+
+            state.stage = "翻译中..."
+            segments = dp.translate_segments(segments, on_progress=on_translate_progress)
+
+            json_path = os.path.join(episode_dir, "data.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(segments, f, ensure_ascii=False, indent=2)
+            dp.save_text_files(
+                segments,
+                os.path.join(episode_dir, "transcript_en.txt"),
+                os.path.join(episode_dir, "transcript_zh.txt"),
+            )
+            dp.generate_html(episode_title, audio_filename, segments, os.path.join(episode_dir, "subtitles.html"))
+
+            state.progress = 1.0
+            state.done = True
+            state.result_dir = episode_dir
+        except Exception as e:
+            state.error = str(e)
+        finally:
+            state.running = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+class ManualTab:
+    """手动处理——不是从RSS订阅来的音频（漏抓的某一集、别的录音）也能走同一套转录+翻译流程，
+    产出格式和自动流程完全一样，处理完在「播客库」页签就能看到"""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.state = ManualState()
+        self.audio_path = None
+
+        frame = ttk.LabelFrame(parent, text="手动添加音频并转录翻译")
+        frame.pack(fill="x", padx=14, pady=14)
+
+        file_row = ttk.Frame(frame)
+        file_row.pack(fill="x", padx=10, pady=(10, 6))
+        ttk.Button(file_row, text="选择音频文件...", command=self._pick_file).pack(side="left")
+        self.file_label = ttk.Label(file_row, text="未选择文件", style="Muted.TLabel")
+        self.file_label.pack(side="left", padx=(10, 0))
+
+        form = ttk.Frame(frame)
+        form.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(form, text="节目名").grid(row=0, column=0, sticky="w", pady=3)
+        self.show_var = tk.StringVar()
+        self.show_combo = ttk.Combobox(form, textvariable=self.show_var, width=20)
+        self.show_combo.grid(row=0, column=1, sticky="w", padx=(6, 0))
+
+        ttk.Label(form, text="期数标题").grid(row=1, column=0, sticky="w", pady=3)
+        self.title_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.title_var, width=45).grid(row=1, column=1, sticky="w", padx=(6, 0))
+
+        self.start_btn = ttk.Button(frame, text="开始转录+翻译", style="Accent.TButton", command=self._start)
+        self.start_btn.pack(anchor="w", padx=10, pady=(0, 6))
+
+        self.progress_bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.progress_bar.pack(fill="x", padx=10, pady=(0, 5))
+        self.status_label = ttk.Label(frame, text="", style="Muted.TLabel")
+        self.status_label.pack(anchor="w", padx=10, pady=(0, 6))
+
+        self.open_result_btn = ttk.Button(frame, text="打开字幕页", command=self._open_result, state="disabled")
+        self.open_result_btn.pack(anchor="w", padx=10, pady=(0, 6))
+
+        ttk.Label(
+            frame, style="Muted.TLabel", wraplength=620, justify="left",
+            text=(
+                "用来处理不是从RSS订阅来的音频——比如某一集播客没被自动抓到，或者你有一段别的录音想转录翻译。"
+                "选好音频文件、填节目名和标题，点「开始转录+翻译」就行，产出格式和自动流程完全一样，会出现在「播客库」里。"
+                "节目名如果跟已有的一样，会归到同一个节目下面；不一样就会新建一个。\n"
+                "提示：如果是用打包好的独立exe运行，这个功能需要电脑上有CUDA运行环境才能跑GPU转录；"
+                "更省心的做法是用 python setup_wizard.py 在项目自带的conda环境里运行。"
+            ),
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+        self.refresh_show_choices()
+
+    def refresh_show_choices(self):
+        config = load_existing_config()
+        self.show_combo["values"] = list(config.get("feeds", {}).keys())
+
+    def _pick_file(self):
+        path = filedialog.askopenfilename(title="选择音频文件", filetypes=AUDIO_FILE_TYPES)
+        if not path:
+            return
+        self.audio_path = path
+        self.file_label.config(text=os.path.basename(path), style="TLabel")
+
+    def _start(self):
+        if not self.audio_path:
+            messagebox.showerror("错误", "请先选择音频文件")
+            return
+        show_name = self.show_var.get().strip()
+        title = self.title_var.get().strip()
+        if not show_name or not title:
+            messagebox.showerror("错误", "节目名和期数标题都要填")
+            return
+
+        self.start_btn.config(state="disabled")
+        self.open_result_btn.config(state="disabled")
+        self.status_label.config(text="开始处理...", style="Muted.TLabel")
+        self.progress_bar["value"] = 0
+        start_manual_processing(self.audio_path, show_name, title, self.state)
+        self._poll()
+
+    def _poll(self):
+        state = self.state
+        self.progress_bar["value"] = state.progress * 100
+        if state.error:
+            self.status_label.config(text=f"处理失败：{state.error}", style="Danger.TLabel")
+            self.start_btn.config(state="normal")
+            return
+        if state.done:
+            self.status_label.config(text="处理完成！", style="Success.TLabel")
+            self.start_btn.config(state="normal")
+            self.open_result_btn.config(state="normal")
+            self.refresh_show_choices()
+            return
+        if state.running:
+            self.status_label.config(text=state.stage, style="Muted.TLabel")
+            self.parent.after(200, self._poll)
+
+    def _open_result(self):
+        if self.state.result_dir:
+            target = os.path.join(self.state.result_dir, "subtitles.html")
+            if os.path.exists(target):
+                os.startfile(target)
+
+
 class App:
-    """顶层窗口：一个「播客库」主页 + 一个「设置」页，用Notebook切换。切到「设置」页时自动按
-    config.json当前内容重新同步一次界面，避免显示的是构造时的旧值"""
+    """顶层窗口：「播客库」主页 + 「手动处理」+ 「设置」，用Notebook切换。切到某个页签时
+    自动刷新一次那个页签的内容（比如设置页按config.json当前内容重新同步），避免显示的是旧值"""
 
     def __init__(self, root):
         self.root = root
         apply_modern_style(root)  # 顺带设置好了DPI缩放
         root.title("播客自动化")
         scale = root.winfo_fpixels("1i") / 96.0
-        root.geometry(f"{int(720 * scale)}x{int(980 * scale)}")
+        root.geometry(f"{int(760 * scale)}x{int(980 * scale)}")
         root.resizable(False, False)
 
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
         home_tab = ttk.Frame(self.notebook)
+        manual_tab = ttk.Frame(self.notebook)
         settings_tab = ttk.Frame(self.notebook)
         self.notebook.add(home_tab, text="播客库")
+        self.notebook.add(manual_tab, text="手动处理")
         self.notebook.add(settings_tab, text="设置")
 
         self.home = HomeTab(home_tab)
+        self.manual = ManualTab(manual_tab)
         self.settings = SetupWizard(settings_tab)
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -829,6 +1081,8 @@ class App:
         current = self.notebook.index(self.notebook.select())
         if current == 0:
             self.home.refresh()
+        elif current == 1:
+            self.manual.refresh_show_choices()
         else:
             self.settings.reload_from_config()
 
