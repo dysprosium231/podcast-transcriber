@@ -419,15 +419,21 @@ def save_latest_log(log):
             f.write(f"{show}::{title}\n")
 
 
-def get_newest_episode(rss_url):
-    """自己用requests取RSS内容再交给feedparser解析（而不是让feedparser直接拿URL），
-    因为feedparser内置的URL抓取不设超时，网络卡住时会无限期挂住"""
+def get_all_episodes(rss_url):
+    """取整个RSS feed的完整历史条目列表（不只是最新一条）。自己用requests取内容再交给
+    feedparser解析（而不是让feedparser直接拿URL），因为feedparser内置的URL抓取不设超时，
+    网络卡住时会无限期挂住"""
     r = requests.get(rss_url, timeout=30, headers=HEADERS)
     r.raise_for_status()
     feed = feedparser.parse(r.content)
-    if not feed.entries:
+    return feed.entries
+
+
+def get_newest_episode(rss_url):
+    entries = get_all_episodes(rss_url)
+    if not entries:
         return None
-    return feed.entries[0]
+    return entries[0]
 
 
 def download_audio(url, filepath, retry_rss_url=None, max_retries=2, on_progress=None):

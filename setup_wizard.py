@@ -12,6 +12,7 @@ import sys
 import json
 import ctypes
 import shutil
+import zipfile
 import subprocess
 import threading
 import tkinter as tk
@@ -837,132 +838,293 @@ AUDIO_FILE_TYPES = [
     ("音频文件", "*.mp3 *.m4a *.wav *.flac *.aac *.ogg *.wma"),
     ("所有文件", "*.*"),
 ]
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".wma"}
 
 # 手动处理跟每天自动跑的daily_podcast.py共用同一套转录/翻译逻辑（不重新写一遍，靠导入复用），
-# 模型在同一次程序运行里只加载一次，重复处理多个音频不用每次都等GPU模型重新加载
+# 模型在同一次程序运行里只加载一次，不管是单个文件、RSS历史下载还是批量本地导入，重复处理
+# 多个音频都不用每次都等GPU模型重新加载
 _manual_model = None
 _manual_batched_model = None
 
 
-class ManualState:
-    """手动处理线程和GUI主线程之间只通过这几个简单字段传递状态（不直接跨线程碰tk控件）"""
+def _wrap_gpu_error(e):
+    """打包成exe之后不会带CUDA运行库（cublas/cudnn加起来有1.7GB，打包不现实），
+    手动处理这几个功能在独立exe下需要电脑上本来就有能被找到的CUDA运行环境；
+    用 python setup_wizard.py 在项目自带的conda环境里跑就没有这个限制"""
+    if getattr(sys, "frozen", False) and any(k in str(e).lower() for k in ("dll", "cublas", "cudnn")):
+        return RuntimeError(
+            "GPU模型加载失败，缺少CUDA运行库（cublas/cudnn等）。"
+            "这是独立exe的已知限制——这些库总共1.7GB左右，没有打包进exe。"
+            "这个功能建议用 `python setup_wizard.py` 在装好conda环境的电脑上运行，不受这个限制。"
+            f"\n\n原始错误：{e}"
+        )
+    return e
 
-    def __init__(self):
-        self.running = False
-        self.stage = ""
-        self.progress = 0.0
-        self.done = False
+
+class BatchJob:
+    """一项待处理的任务：一个音频（不管来自本地文件、RSS下载还是zip压缩包）要归到哪个节目、
+    起什么标题。source_type是"local"/"download"/"zip"之一，source是对应的路径/URL/(zip路径,条目名)"""
+
+    def __init__(self, show_name, episode_title, source_type, source):
+        self.show_name = show_name
+        self.episode_title = episode_title
+        self.source_type = source_type
+        self.source = source
+        self.status = "排队中"
         self.error = None
         self.result_dir = None
 
 
-def start_manual_processing(audio_src_path, show_name, episode_title, state):
+class BatchState:
+    """批量处理线程和GUI主线程之间只通过这几个简单字段传递状态（不直接跨线程碰tk控件）"""
+
+    def __init__(self):
+        self.jobs = []
+        self.current_index = -1
+        self.running = False
+        self.done = False
+        self.cancel_requested = False
+        self.item_progress = 0.0
+
+
+def episode_target_dir(dp, job):
+    safe_title = dp.sanitize_filename(job.episode_title)
+    return os.path.join(EPISODES_DIR, job.show_name, safe_title)
+
+
+def check_conflicts(jobs):
+    """处理开始前一次性检查哪些目标文件夹已经存在（已经处理过），用于批量询问是否覆盖，
+    而不是一项项弹窗打断"""
+    try:
+        import daily_podcast as dp
+    except Exception:
+        return []
+    conflicts = []
+    for job in jobs:
+        episode_dir = episode_target_dir(dp, job)
+        if os.path.exists(os.path.join(episode_dir, "subtitles.html")):
+            conflicts.append(job)
+    return conflicts
+
+
+def confirm_and_filter_conflicts(jobs):
+    """有冲突就一次性弹一个框列出全部冲突项，问是否覆盖；返回过滤后的任务列表
+    （用户选"否"就去掉那些冲突项，其余照常）。返回None表示用户想直接取消整个操作"""
+    conflicts = check_conflicts(jobs)
+    if not conflicts:
+        return jobs
+    names = "\n".join(f"「{j.show_name}」{j.episode_title}" for j in conflicts)
+    overwrite = messagebox.askyesnocancel(
+        "部分内容已存在",
+        f"以下 {len(conflicts)} 项之前已经处理过：\n\n{names}\n\n"
+        "是否覆盖重新处理？\n「是」=全部覆盖　「否」=跳过这些、只处理其余项　「取消」=不处理任何项目",
+    )
+    if overwrite is None:
+        return None
+    if overwrite:
+        return jobs
+    conflict_ids = {id(j) for j in conflicts}
+    return [j for j in jobs if id(j) not in conflict_ids]
+
+
+def _process_one_job(dp, job, on_stage):
+    global _manual_model, _manual_batched_model
+
+    episode_dir = episode_target_dir(dp, job)
+    os.makedirs(episode_dir, exist_ok=True)
+
+    if job.source_type == "local":
+        ext = os.path.splitext(job.source)[1] or ".mp3"
+        audio_filename = f"audio{ext}"
+        audio_dest = os.path.join(episode_dir, audio_filename)
+        on_stage("复制音频文件...", 0.05)
+        shutil.copyfile(job.source, audio_dest)
+        on_stage("准备转录...", 0.2)
+    elif job.source_type == "zip":
+        zip_path, entry_name = job.source
+        ext = os.path.splitext(entry_name)[1] or ".mp3"
+        audio_filename = f"audio{ext}"
+        audio_dest = os.path.join(episode_dir, audio_filename)
+        on_stage("解压音频文件...", 0.05)
+        with zipfile.ZipFile(zip_path) as zf, zf.open(entry_name) as src, open(audio_dest, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        on_stage("准备转录...", 0.2)
+    else:  # download
+        audio_filename = "audio.mp3"
+        audio_dest = os.path.join(episode_dir, audio_filename)
+        dp.download_audio(
+            job.source, audio_dest,
+            on_progress=lambda p: on_stage(f"下载中 {int(p * 100)}%", p * 0.2),
+        )
+
+    if _manual_model is None:
+        on_stage("正在加载GPU模型（首次可能需要1-2分钟）...", 0.2)
+        try:
+            _manual_model = dp.WhisperModel(dp.MODEL_PATH, device="cuda", compute_type="float16")
+            _manual_batched_model = dp.BatchedInferencePipeline(model=_manual_model)
+        except Exception as e:
+            raise _wrap_gpu_error(e)
+
+    segments = dp.transcribe_audio(
+        _manual_batched_model, audio_dest,
+        on_progress=lambda p: on_stage(f"转录中 {int(p * 100)}%", 0.2 + p * 0.6),
+    )
+    segments = dp.translate_segments(
+        segments,
+        on_progress=lambda p: on_stage(f"翻译中 {int(p * 100)}%", 0.8 + p * 0.2),
+    )
+
+    with open(os.path.join(episode_dir, "data.json"), "w", encoding="utf-8") as f:
+        json.dump(segments, f, ensure_ascii=False, indent=2)
+    dp.save_text_files(
+        segments,
+        os.path.join(episode_dir, "transcript_en.txt"),
+        os.path.join(episode_dir, "transcript_zh.txt"),
+    )
+    dp.generate_html(job.episode_title, audio_filename, segments, os.path.join(episode_dir, "subtitles.html"))
+    return episode_dir
+
+
+def run_batch(jobs, state):
+    """排队顺序处理一批任务（下载/转录/翻译不能并行，GPU和网络本来就得一个个来）。
+    取消只影响还没开始的排队项，已经在跑的那一项会跑完"""
+    state.jobs = jobs
+    state.current_index = -1
     state.running = True
-    state.progress = 0.0
-    state.stage = "准备中..."
     state.done = False
-    state.error = None
-    state.result_dir = None
-
-    def on_transcribe_progress(p):
-        state.progress = p * 0.6
-        state.stage = f"转录中 {int(p * 100)}%"
-
-    def on_translate_progress(p):
-        state.progress = 0.6 + p * 0.4
-        state.stage = f"翻译中 {int(p * 100)}%"
+    state.cancel_requested = False
+    state.item_progress = 0.0
 
     def worker():
-        global _manual_model, _manual_batched_model
         try:
             import daily_podcast as dp
         except FileNotFoundError:
-            state.error = "找不到 config.json，请先在「设置」页保存一次配置"
+            for j in jobs:
+                j.status = "失败"
+                j.error = "找不到 config.json，请先在「设置」页保存一次配置"
             state.running = False
-            return
-        except Exception as e:
-            state.error = f"加载主程序模块失败：{e}"
-            state.running = False
-            return
-
-        try:
-            show_dir = os.path.join(EPISODES_DIR, show_name)
-            os.makedirs(show_dir, exist_ok=True)
-            safe_title = dp.sanitize_filename(episode_title)
-            episode_dir = os.path.join(show_dir, safe_title)
-            os.makedirs(episode_dir, exist_ok=True)
-
-            ext = os.path.splitext(audio_src_path)[1] or ".mp3"
-            audio_filename = f"audio{ext}"
-            audio_dest = os.path.join(episode_dir, audio_filename)
-
-            state.stage = "复制音频文件..."
-            shutil.copyfile(audio_src_path, audio_dest)
-
-            if _manual_model is None:
-                state.stage = "正在加载GPU模型（首次可能需要1-2分钟）..."
-                try:
-                    _manual_model = dp.WhisperModel(dp.MODEL_PATH, device="cuda", compute_type="float16")
-                    _manual_batched_model = dp.BatchedInferencePipeline(model=_manual_model)
-                except Exception as e:
-                    if getattr(sys, "frozen", False) and ("dll" in str(e).lower() or "cublas" in str(e).lower() or "cudnn" in str(e).lower()):
-                        # 打包成exe之后不会带CUDA运行库（cublas/cudnn加起来有1.7GB，打包不现实），
-                        # 手动处理这个功能在独立exe下需要电脑上本来就有能被找到的CUDA运行环境；
-                        # 用 python setup_wizard.py 在项目自带的conda环境里跑就没有这个限制
-                        raise RuntimeError(
-                            "GPU模型加载失败，缺少CUDA运行库（cublas/cudnn等）。"
-                            "这是独立exe的已知限制——这些库总共1.7GB左右，没有打包进exe。"
-                            "「手动处理」这个功能建议用 `python setup_wizard.py` 在装好conda环境的电脑上运行，"
-                            f"不受这个限制。\n\n原始错误：{e}"
-                        ) from e
-                    raise
-
-            state.stage = "转录中（GPU运算）..."
-            segments = dp.transcribe_audio(_manual_batched_model, audio_dest, on_progress=on_transcribe_progress)
-
-            state.stage = "翻译中..."
-            segments = dp.translate_segments(segments, on_progress=on_translate_progress)
-
-            json_path = os.path.join(episode_dir, "data.json")
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(segments, f, ensure_ascii=False, indent=2)
-            dp.save_text_files(
-                segments,
-                os.path.join(episode_dir, "transcript_en.txt"),
-                os.path.join(episode_dir, "transcript_zh.txt"),
-            )
-            dp.generate_html(episode_title, audio_filename, segments, os.path.join(episode_dir, "subtitles.html"))
-
-            state.progress = 1.0
             state.done = True
-            state.result_dir = episode_dir
+            return
         except Exception as e:
-            state.error = str(e)
-        finally:
+            for j in jobs:
+                j.status = "失败"
+                j.error = f"加载主程序模块失败：{e}"
             state.running = False
+            state.done = True
+            return
+
+        for idx, job in enumerate(jobs):
+            if state.cancel_requested:
+                job.status = "已取消"
+                continue
+            state.current_index = idx
+            state.item_progress = 0.0
+            job.status = "处理中"
+
+            def on_stage(text, progress, _job=job):
+                _job.status = text
+                state.item_progress = progress
+
+            try:
+                job.result_dir = _process_one_job(dp, job, on_stage)
+                job.status = "完成"
+            except Exception as e:
+                job.status = "失败"
+                job.error = str(e)
+
+        state.running = False
+        state.done = True
 
     threading.Thread(target=worker, daemon=True).start()
 
 
-class ManualTab:
-    """手动处理——不是从RSS订阅来的音频（漏抓的某一集、别的录音）也能走同一套转录+翻译流程，
-    产出格式和自动流程完全一样，处理完在「播客库」页签就能看到"""
+class BatchProgressWidget:
+    """RSS历史下载、批量本地导入共用的排队进度展示：每项一行状态 + 当前项进度条 + 取消剩余"""
+
+    def __init__(self, parent):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+        self.frame = frame
+
+        self.status_tree = ttk.Treeview(frame, columns=("status",), show="tree headings", height=7)
+        self.status_tree.heading("#0", text="标题")
+        self.status_tree.heading("status", text="状态")
+        self.status_tree.column("#0", width=420)
+        self.status_tree.column("status", width=160)
+        self.status_tree.pack(fill="both", expand=True, padx=10, pady=(6, 4))
+
+        self.progress_bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.progress_bar.pack(fill="x", padx=10, pady=(0, 4))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill="x", padx=10, pady=(0, 8))
+        self.cancel_btn = ttk.Button(btn_row, text="取消剩余排队项", command=self._cancel, state="disabled")
+        self.cancel_btn.pack(side="left")
+        self.overall_label = ttk.Label(btn_row, text="", style="Muted.TLabel")
+        self.overall_label.pack(side="left", padx=(10, 0))
+
+        self._job_nodes = {}
+        self._state = None
+        self._on_all_done = None
+
+    def start(self, jobs, state, on_all_done=None):
+        self._state = state
+        self._on_all_done = on_all_done
+        self.status_tree.delete(*self.status_tree.get_children())
+        self._job_nodes = {}
+        for job in jobs:
+            node = self.status_tree.insert("", "end", text=f"「{job.show_name}」{job.episode_title}", values=(job.status,))
+            self._job_nodes[id(job)] = node
+        self.cancel_btn.config(state="normal")
+        self.overall_label.config(text=f"共 {len(jobs)} 项", style="Muted.TLabel")
+        self._poll()
+
+    def _cancel(self):
+        if self._state:
+            self._state.cancel_requested = True
+        self.cancel_btn.config(state="disabled")
+
+    def _poll(self):
+        state = self._state
+        for job in state.jobs:
+            node = self._job_nodes.get(id(job))
+            if node:
+                self.status_tree.item(node, values=(job.status,))
+        self.progress_bar["value"] = state.item_progress * 100
+        if state.done:
+            done_count = sum(1 for j in state.jobs if j.status == "完成")
+            fail_count = sum(1 for j in state.jobs if j.status == "失败")
+            skip_count = sum(1 for j in state.jobs if j.status == "已取消")
+            text = f"全部结束：{done_count} 完成，{fail_count} 失败"
+            if skip_count:
+                text += f"，{skip_count} 未开始就被取消"
+            self.overall_label.config(text=text, style="Success.TLabel" if fail_count == 0 else "Danger.TLabel")
+            self.cancel_btn.config(state="disabled")
+            if self._on_all_done:
+                self._on_all_done()
+            return
+        if state.running:
+            idx = state.current_index
+            self.overall_label.config(text=f"正在处理第 {idx + 1}/{len(state.jobs)} 项", style="Muted.TLabel")
+            self.frame.after(200, self._poll)
+
+
+class SingleFilePane:
+    """手动处理 - 单个文件：不是从RSS订阅来的音频（漏抓的某一集、别的录音）也能走同一套
+    转录+翻译流程，产出格式和自动流程完全一样，处理完在「播客库」页签就能看到"""
 
     def __init__(self, parent):
         self.parent = parent
-        self.state = ManualState()
+        self.state = BatchState()
         self.audio_path = None
 
-        frame = ttk.LabelFrame(parent, text="手动添加音频并转录翻译")
-        frame.pack(fill="x", padx=14, pady=14)
-
-        file_row = ttk.Frame(frame)
-        file_row.pack(fill="x", padx=10, pady=(10, 6))
+        file_row = ttk.Frame(parent)
+        file_row.pack(fill="x", padx=10, pady=(14, 6))
         ttk.Button(file_row, text="选择音频文件...", command=self._pick_file).pack(side="left")
         self.file_label = ttk.Label(file_row, text="未选择文件", style="Muted.TLabel")
         self.file_label.pack(side="left", padx=(10, 0))
 
-        form = ttk.Frame(frame)
+        form = ttk.Frame(parent)
         form.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Label(form, text="节目名").grid(row=0, column=0, sticky="w", pady=3)
         self.show_var = tk.StringVar()
@@ -973,22 +1135,20 @@ class ManualTab:
         self.title_var = tk.StringVar()
         ttk.Entry(form, textvariable=self.title_var, width=45).grid(row=1, column=1, sticky="w", padx=(6, 0))
 
-        self.start_btn = ttk.Button(frame, text="开始转录+翻译", style="Accent.TButton", command=self._start)
+        self.start_btn = ttk.Button(parent, text="开始转录+翻译", style="Accent.TButton", command=self._start)
         self.start_btn.pack(anchor="w", padx=10, pady=(0, 6))
 
-        self.progress_bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.progress_bar = ttk.Progressbar(parent, mode="determinate", maximum=100)
         self.progress_bar.pack(fill="x", padx=10, pady=(0, 5))
-        self.status_label = ttk.Label(frame, text="", style="Muted.TLabel")
+        self.status_label = ttk.Label(parent, text="", style="Muted.TLabel")
         self.status_label.pack(anchor="w", padx=10, pady=(0, 6))
 
-        self.open_result_btn = ttk.Button(frame, text="打开字幕页", command=self._open_result, state="disabled")
+        self.open_result_btn = ttk.Button(parent, text="打开字幕页", command=self._open_result, state="disabled")
         self.open_result_btn.pack(anchor="w", padx=10, pady=(0, 6))
 
         ttk.Label(
-            frame, style="Muted.TLabel", wraplength=620, justify="left",
+            parent, style="Muted.TLabel", wraplength=680, justify="left",
             text=(
-                "用来处理不是从RSS订阅来的音频——比如某一集播客没被自动抓到，或者你有一段别的录音想转录翻译。"
-                "选好音频文件、填节目名和标题，点「开始转录+翻译」就行，产出格式和自动流程完全一样，会出现在「播客库」里。"
                 "节目名如果跟已有的一样，会归到同一个节目下面；不一样就会新建一个。\n"
                 "提示：如果是用打包好的独立exe运行，这个功能需要电脑上有CUDA运行环境才能跑GPU转录；"
                 "更省心的做法是用 python setup_wizard.py 在项目自带的conda环境里运行。"
@@ -1018,35 +1178,327 @@ class ManualTab:
             messagebox.showerror("错误", "节目名和期数标题都要填")
             return
 
+        jobs = [BatchJob(show_name, title, "local", self.audio_path)]
+        jobs = confirm_and_filter_conflicts(jobs)
+        if not jobs:
+            return
+
         self.start_btn.config(state="disabled")
         self.open_result_btn.config(state="disabled")
         self.status_label.config(text="开始处理...", style="Muted.TLabel")
         self.progress_bar["value"] = 0
-        start_manual_processing(self.audio_path, show_name, title, self.state)
+        self._job = jobs[0]
+        run_batch(jobs, self.state)
         self._poll()
 
     def _poll(self):
         state = self.state
-        self.progress_bar["value"] = state.progress * 100
-        if state.error:
-            self.status_label.config(text=f"处理失败：{state.error}", style="Danger.TLabel")
-            self.start_btn.config(state="normal")
-            return
+        self.progress_bar["value"] = state.item_progress * 100
         if state.done:
-            self.status_label.config(text="处理完成！", style="Success.TLabel")
+            job = self._job
             self.start_btn.config(state="normal")
-            self.open_result_btn.config(state="normal")
-            self.refresh_show_choices()
+            if job.status == "完成":
+                self.status_label.config(text="处理完成！", style="Success.TLabel")
+                self.open_result_btn.config(state="normal")
+                self.refresh_show_choices()
+            elif job.status == "已取消":
+                self.status_label.config(text="已取消", style="Muted.TLabel")
+            else:
+                self.status_label.config(text=f"处理失败：{job.error}", style="Danger.TLabel")
             return
         if state.running:
-            self.status_label.config(text=state.stage, style="Muted.TLabel")
+            self.status_label.config(text=self._job.status, style="Muted.TLabel")
             self.parent.after(200, self._poll)
 
     def _open_result(self):
-        if self.state.result_dir:
-            target = os.path.join(self.state.result_dir, "subtitles.html")
+        if self._job.result_dir:
+            target = os.path.join(self._job.result_dir, "subtitles.html")
             if os.path.exists(target):
                 os.startfile(target)
+
+
+class RssHistoryPane:
+    """手动处理 - RSS历史下载：daily_podcast.py正常运行只抓最新一期，这里可以把RSS里的完整
+    历史列出来，勾选想要的几期，一次性批量下载+转录+翻译。也支持临时粘贴一个不在订阅列表里的
+    RSS地址，不局限于config.json里已经配置好的节目"""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.state = BatchState()
+        self.entries = []  # [(tree节点id, 标题, 音频URL)]
+
+        top = ttk.Frame(parent)
+        top.pack(fill="x", padx=10, pady=(14, 6))
+        ttk.Label(top, text="已配置节目").pack(side="left")
+        self.known_show_var = tk.StringVar()
+        self.known_show_combo = ttk.Combobox(top, textvariable=self.known_show_var, width=14, state="readonly")
+        self.known_show_combo.pack(side="left", padx=(4, 12))
+        self.known_show_combo.bind("<<ComboboxSelected>>", self._on_known_show_selected)
+
+        ttk.Label(top, text="RSS地址").pack(side="left")
+        self.rss_url_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.rss_url_var, width=32).pack(side="left", padx=(4, 12))
+        ttk.Button(top, text="拉取列表", style="Accent.TButton", command=self._fetch).pack(side="left")
+
+        self.tree = ttk.Treeview(
+            parent, columns=("date",), show="tree headings", height=9, selectmode="extended",
+        )
+        self.tree.heading("#0", text="标题")
+        self.tree.heading("date", text="发布时间")
+        self.tree.column("#0", width=440)
+        self.tree.column("date", width=180)
+        self.tree.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+        sel_row = ttk.Frame(parent)
+        sel_row.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Button(sel_row, text="全选", command=self._select_all).pack(side="left")
+        ttk.Button(sel_row, text="取消全选", command=lambda: self.tree.selection_remove(*self.tree.get_children())).pack(side="left", padx=(6, 0))
+        self.fetch_status_label = ttk.Label(sel_row, text="", style="Muted.TLabel")
+        self.fetch_status_label.pack(side="left", padx=(10, 0))
+
+        target_row = ttk.Frame(parent)
+        target_row.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(target_row, text="下载后归到节目名").pack(side="left")
+        self.target_show_var = tk.StringVar()
+        ttk.Combobox(target_row, textvariable=self.target_show_var, width=20).pack(side="left", padx=(6, 0))
+
+        self.start_btn = ttk.Button(parent, text="下载并处理选中项", style="Accent.TButton", command=self._start)
+        self.start_btn.pack(anchor="w", padx=10, pady=(0, 8))
+
+        self.progress_widget = BatchProgressWidget(parent)
+
+        ttk.Label(
+            parent, style="Muted.TLabel", wraplength=680, justify="left",
+            text="选中多期会排队依次下载+转录+翻译（不能同时跑多个，GPU一次只能处理一个）。"
+                 "已经处理过的期数重新选中会先问是否覆盖，一次性问完不会一项项弹窗。",
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+        self.refresh_show_choices()
+
+    def refresh_show_choices(self):
+        config = load_existing_config()
+        shows = list(config.get("feeds", {}).keys())
+        self.known_show_combo["values"] = shows
+
+    def _on_known_show_selected(self, _event=None):
+        show = self.known_show_var.get()
+        config = load_existing_config()
+        url = config.get("feeds", {}).get(show)
+        if url:
+            self.rss_url_var.set(url)
+        self.target_show_var.set(show)
+
+    def _select_all(self):
+        self.tree.selection_set(self.tree.get_children())
+
+    def _fetch(self):
+        url = self.rss_url_var.get().strip()
+        if not url:
+            messagebox.showerror("错误", "请先选择已配置节目，或者自己填一个RSS地址")
+            return
+        try:
+            import daily_podcast as dp
+        except FileNotFoundError:
+            messagebox.showerror("错误", "找不到 config.json，请先在「设置」页保存一次配置")
+            return
+        except Exception as e:
+            messagebox.showerror("错误", f"加载主程序模块失败：{e}")
+            return
+
+        self.fetch_status_label.config(text="拉取中...", style="Muted.TLabel")
+        self.parent.update_idletasks()
+        try:
+            entries = dp.get_all_episodes(url)
+        except Exception as e:
+            messagebox.showerror("错误", f"拉取RSS失败：{e}")
+            self.fetch_status_label.config(text="", style="Muted.TLabel")
+            return
+
+        self.tree.delete(*self.tree.get_children())
+        self.entries = []
+        for entry in entries:
+            enclosures = entry.get("enclosures") or []
+            if not enclosures:
+                continue
+            audio_url = enclosures[0].href
+            pub = entry.get("published", "")
+            node = self.tree.insert("", "end", text=entry.get("title", "（无标题）"), values=(pub,))
+            self.entries.append((node, entry.get("title", "（无标题）"), audio_url))
+
+        if not self.entries:
+            self.fetch_status_label.config(text="没有找到带音频链接的条目", style="Warning.TLabel")
+        else:
+            self.fetch_status_label.config(text=f"共 {len(self.entries)} 期", style="Muted.TLabel")
+
+    def _start(self):
+        target_show = self.target_show_var.get().strip()
+        if not target_show:
+            messagebox.showerror("错误", "请填写下载后归到哪个节目名")
+            return
+        selected_ids = set(self.tree.selection())
+        if not selected_ids:
+            messagebox.showerror("错误", "请先勾选要下载的期数")
+            return
+
+        jobs = [
+            BatchJob(target_show, title, "download", url)
+            for node, title, url in self.entries
+            if node in selected_ids
+        ]
+        jobs = confirm_and_filter_conflicts(jobs)
+        if not jobs:
+            return
+
+        self.start_btn.config(state="disabled")
+        run_batch(jobs, self.state)
+        self.progress_widget.start(jobs, self.state, on_all_done=self._on_done)
+
+    def _on_done(self):
+        self.start_btn.config(state="normal")
+        self.refresh_show_choices()
+
+
+class LocalBatchPane:
+    """手动处理 - 批量本地导入：一整个文件夹或zip压缩包里的一堆mp3（不是来自任何RSS的本地
+    播客归档），逐个建文件夹转录翻译。标题默认用文件名（去掉扩展名），不支持逐条改名——
+    想要自定义标题就用「单个文件」那个页签"""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.state = BatchState()
+        self.discovered = []  # [(显示名, source_type, source)]
+
+        top = ttk.Frame(parent)
+        top.pack(fill="x", padx=10, pady=(14, 6))
+        ttk.Button(top, text="选择文件夹...", command=self._pick_folder).pack(side="left")
+        ttk.Button(top, text="选择ZIP压缩包...", command=self._pick_zip).pack(side="left", padx=(8, 0))
+        self.source_label = ttk.Label(top, text="未选择", style="Muted.TLabel")
+        self.source_label.pack(side="left", padx=(10, 0))
+
+        self.tree = ttk.Treeview(parent, columns=(), show="tree", height=9, selectmode="extended")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+        sel_row = ttk.Frame(parent)
+        sel_row.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Button(sel_row, text="全选", command=self._select_all).pack(side="left")
+        ttk.Button(sel_row, text="取消全选", command=lambda: self.tree.selection_remove(*self.tree.get_children())).pack(side="left", padx=(6, 0))
+
+        target_row = ttk.Frame(parent)
+        target_row.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(target_row, text="归到节目名").pack(side="left")
+        self.target_show_var = tk.StringVar()
+        ttk.Combobox(target_row, textvariable=self.target_show_var, width=20).pack(side="left", padx=(6, 0))
+
+        self.start_btn = ttk.Button(parent, text="批量转录+翻译选中项", style="Accent.TButton", command=self._start)
+        self.start_btn.pack(anchor="w", padx=10, pady=(0, 8))
+
+        self.progress_widget = BatchProgressWidget(parent)
+
+        ttk.Label(
+            parent, style="Muted.TLabel", wraplength=680, justify="left",
+            text="只扫描所选文件夹本身（不含子文件夹）里的音频文件；标题默认取文件名（不含扩展名）。"
+                 "支持 mp3/m4a/wav/flac/aac/ogg/wma。选中多个会排队依次处理。",
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+        self.refresh_show_choices()
+
+    def refresh_show_choices(self):
+        pass  # target_show是Entry风格的Combobox，不需要每次都重新拉取列表，_start前用户自己填/选
+
+    def _pick_folder(self):
+        folder = filedialog.askdirectory(title="选择包含音频文件的文件夹")
+        if not folder:
+            return
+        found = []
+        for name in sorted(os.listdir(folder)):
+            path = os.path.join(folder, name)
+            ext = os.path.splitext(name)[1].lower()
+            if os.path.isfile(path) and ext in AUDIO_EXTENSIONS:
+                title = os.path.splitext(name)[0]
+                found.append((title, "local", path))
+        self._populate(found, f"文件夹：{folder}")
+
+    def _pick_zip(self):
+        zip_path = filedialog.askopenfilename(title="选择ZIP压缩包", filetypes=[("ZIP压缩包", "*.zip")])
+        if not zip_path:
+            return
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                names = zf.namelist()
+        except Exception as e:
+            messagebox.showerror("错误", f"打开压缩包失败：{e}")
+            return
+        found = []
+        for name in sorted(names):
+            ext = os.path.splitext(name)[1].lower()
+            if ext in AUDIO_EXTENSIONS and not name.endswith("/"):
+                title = os.path.splitext(os.path.basename(name))[0]
+                found.append((title, "zip", (zip_path, name)))
+        self._populate(found, f"压缩包：{os.path.basename(zip_path)}")
+
+    def _populate(self, found, source_desc):
+        self.discovered = found
+        self.tree.delete(*self.tree.get_children())
+        for title, _stype, _source in found:
+            self.tree.insert("", "end", text=title)
+        if found:
+            self.source_label.config(text=f"{source_desc}（找到 {len(found)} 个音频文件）", style="TLabel")
+        else:
+            self.source_label.config(text=f"{source_desc}（没有找到音频文件）", style="Warning.TLabel")
+
+    def _select_all(self):
+        self.tree.selection_set(self.tree.get_children())
+
+    def _start(self):
+        target_show = self.target_show_var.get().strip()
+        if not target_show:
+            messagebox.showerror("错误", "请填写归到哪个节目名")
+            return
+        selected_indices = {self.tree.index(i) for i in self.tree.selection()}
+        if not selected_indices:
+            messagebox.showerror("错误", "请先勾选要处理的音频")
+            return
+
+        jobs = [
+            BatchJob(target_show, title, stype, source)
+            for i, (title, stype, source) in enumerate(self.discovered)
+            if i in selected_indices
+        ]
+        jobs = confirm_and_filter_conflicts(jobs)
+        if not jobs:
+            return
+
+        self.start_btn.config(state="disabled")
+        run_batch(jobs, self.state)
+        self.progress_widget.start(jobs, self.state, on_all_done=self._on_done)
+
+    def _on_done(self):
+        self.start_btn.config(state="normal")
+
+
+class ManualProcessingTab:
+    """手动处理——三种来源殊途同归，都是走同一套 run_batch/_process_one_job 引擎：
+    单个本地文件、RSS历史里挑几期、本地一批音频（文件夹或zip）"""
+
+    def __init__(self, parent):
+        inner = ttk.Notebook(parent)
+        inner.pack(fill="both", expand=True, padx=4, pady=4)
+
+        single_frame = ttk.Frame(inner)
+        rss_frame = ttk.Frame(inner)
+        batch_frame = ttk.Frame(inner)
+        inner.add(single_frame, text="单个文件")
+        inner.add(rss_frame, text="RSS历史下载")
+        inner.add(batch_frame, text="批量本地导入")
+
+        self.single = SingleFilePane(single_frame)
+        self.rss = RssHistoryPane(rss_frame)
+        self.batch = LocalBatchPane(batch_frame)
+
+    def refresh_show_choices(self):
+        self.single.refresh_show_choices()
+        self.rss.refresh_show_choices()
+        self.batch.refresh_show_choices()
 
 
 class App:
@@ -1072,7 +1524,7 @@ class App:
         self.notebook.add(settings_tab, text="设置")
 
         self.home = HomeTab(home_tab)
-        self.manual = ManualTab(manual_tab)
+        self.manual = ManualProcessingTab(manual_tab)
         self.settings = SetupWizard(settings_tab)
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
