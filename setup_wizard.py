@@ -1302,7 +1302,9 @@ class RssHistoryPane:
         ttk.Label(top, text="RSS地址").pack(side="left")
         self.rss_url_var = tk.StringVar()
         ttk.Entry(top, textvariable=self.rss_url_var, width=32).pack(side="left", padx=(4, 12))
-        ttk.Button(top, text="拉取列表", style="Accent.TButton", command=self._fetch).pack(side="left")
+        self.fetch_btn = ttk.Button(top, text="拉取列表", style="Accent.TButton", command=self._fetch)
+        self.fetch_btn.pack(side="left")
+        self._fetch_state = None
 
         self.tree = ttk.Treeview(
             parent, columns=("date",), show="tree headings", height=9, selectmode="extended",
@@ -1361,23 +1363,47 @@ class RssHistoryPane:
             messagebox.showerror("错误", "请先选择已配置节目，或者自己填一个RSS地址")
             return
 
+        # 抓取+解析（尤其是历史很长的feed，比如上千期）如果直接在主线程做，界面会卡成
+        # "未响应"好几秒——跟run_batch/模型下载一样的套路：丢到后台线程跑，主线程只用
+        # after()轮询一个普通对象的状态，不直接跨线程碰tk控件
+        self.fetch_btn.config(state="disabled")
         self.fetch_status_label.config(text="拉取中...", style="Muted.TLabel")
-        self.parent.update_idletasks()
-        try:
-            # 跟daily_podcast.py的get_all_episodes同样的抓取方式（自己带超时，不让feedparser
-            # 直接拿URL），这里直接内联一遍而不是导入daily_podcast.py，避免GUI进程被迫
-            # 加载它那些转录/翻译相关的重量级依赖
-            r = requests.get(url, timeout=30, headers=RSS_HEADERS)
-            r.raise_for_status()
-            entries = feedparser.parse(r.content).entries
-        except Exception as e:
-            messagebox.showerror("错误", f"拉取RSS失败：{e}")
+
+        state = {"done": False, "error": None, "entries": None}
+        self._fetch_state = state
+
+        def worker():
+            try:
+                # 跟daily_podcast.py的get_all_episodes同样的抓取方式（自己带超时，不让
+                # feedparser直接拿URL），这里直接内联一遍而不是导入daily_podcast.py，
+                # 避免GUI进程被迫加载它那些转录/翻译相关的重量级依赖
+                r = requests.get(url, timeout=30, headers=RSS_HEADERS)
+                r.raise_for_status()
+                state["entries"] = feedparser.parse(r.content).entries
+            except Exception as e:
+                state["error"] = str(e)
+            finally:
+                state["done"] = True
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.parent.after(200, self._poll_fetch)
+
+    def _poll_fetch(self):
+        state = self._fetch_state
+        if not state["done"]:
+            self.parent.after(200, self._poll_fetch)
+            return
+
+        self.fetch_btn.config(state="normal")
+
+        if state["error"] is not None:
+            messagebox.showerror("错误", f"拉取RSS失败：{state['error']}")
             self.fetch_status_label.config(text="", style="Muted.TLabel")
             return
 
         self.tree.delete(*self.tree.get_children())
         self.entries = []
-        for entry in entries:
+        for entry in state["entries"]:
             enclosures = entry.get("enclosures") or []
             if not enclosures:
                 continue
