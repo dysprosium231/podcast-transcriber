@@ -17,6 +17,8 @@ from tqdm import tqdm
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
+RUN_HIDDEN_VBS_PATH = os.path.join(SCRIPT_DIR, "run_hidden.vbs")
+TASK_NAME_DEFAULT = "DailyPodcast"
 
 WHISPER_MODEL_CHOICES = [
     "tiny", "tiny.en", "base", "base.en", "small", "small.en",
@@ -39,6 +41,40 @@ def load_existing_config():
         except Exception:
             pass
     return {}
+
+
+def _run_hidden(args):
+    """跑一个命令行工具但不弹黑框窗口（schtasks本身没有GUI，用CREATE_NO_WINDOW避免闪一下）"""
+    return subprocess.run(
+        args, capture_output=True, text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+
+def get_existing_task_time(task_name):
+    """查询这个计划任务现在配置的每日触发时间，找不到就返回None（用于向导打开时回填）。
+    schtasks的输出语言跟系统区域设置走，中文系统上是"开始时间:"而不是"Start Time:"，两种都认"""
+    result = _run_hidden(["schtasks", "/query", "/tn", task_name, "/fo", "LIST", "/v"])
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Start Time:") or stripped.startswith("开始时间:"):
+            return stripped.split(":", 1)[1].strip()
+    return None
+
+
+def create_or_update_daily_task(task_name, hh, mm):
+    """创建/覆盖一个每天固定时间启动run_hidden.vbs的计划任务，不需要管理员权限（当前用户任务）"""
+    tr_value = f'wscript.exe "{RUN_HIDDEN_VBS_PATH}"'
+    return _run_hidden([
+        "schtasks", "/create", "/tn", task_name, "/tr", tr_value,
+        "/sc", "daily", "/st", f"{hh:02d}:{mm:02d}", "/f",
+    ])
+
+
+def run_task_now(task_name):
+    return _run_hidden(["schtasks", "/run", "/tn", task_name])
 
 
 def model_is_downloaded(size):
@@ -98,7 +134,7 @@ class SetupWizard:
     def __init__(self, root):
         self.root = root
         self.root.title("播客自动化 - 配置向导")
-        self.root.geometry("640x680")
+        self.root.geometry("640x900")
         self.root.resizable(False, False)
 
         existing = load_existing_config()
@@ -107,6 +143,7 @@ class SetupWizard:
         self._build_feeds_section(existing.get("feeds", {}))
         self._build_translation_section(existing.get("translation", {}))
         self._build_model_section(existing.get("whisper_model_size", "large-v3"))
+        self._build_schedule_section()
         self._build_bottom_buttons()
 
     # ---------------- 播客订阅 ----------------
@@ -271,6 +308,83 @@ class SetupWizard:
         if state.running:
             self.download_status_label.config(text=f"下载中... {state.desc}", foreground="#888")
             self.root.after(200, self._poll_download)
+
+    # ---------------- 定时任务 ----------------
+    def _build_schedule_section(self):
+        frame = ttk.LabelFrame(self.root, text="每日自动运行（Windows 计划任务）")
+        frame.pack(fill="x", padx=12, pady=6)
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x", padx=8, pady=8)
+        ttk.Label(row, text="任务名称").pack(side="left")
+        self.task_name_var = tk.StringVar(value=TASK_NAME_DEFAULT)
+        ttk.Entry(row, textvariable=self.task_name_var, width=16).pack(side="left", padx=(4, 16))
+
+        ttk.Label(row, text="每天几点触发").pack(side="left")
+        default_hh, default_mm = 10, 0
+        existing_time = get_existing_task_time(TASK_NAME_DEFAULT)  # 比如 "10:00:00"，任务已存在时按现状回填
+        if existing_time:
+            try:
+                parts = existing_time.split(":")
+                default_hh, default_mm = int(parts[0]), int(parts[1])
+            except (ValueError, IndexError):
+                pass
+        self.hour_var = tk.StringVar(value=f"{default_hh:02d}")
+        self.minute_var = tk.StringVar(value=f"{default_mm:02d}")
+        ttk.Combobox(
+            row, textvariable=self.hour_var, values=[f"{h:02d}" for h in range(24)],
+            state="readonly", width=4,
+        ).pack(side="left", padx=(4, 2))
+        ttk.Label(row, text=":").pack(side="left")
+        ttk.Combobox(
+            row, textvariable=self.minute_var, values=[f"{m:02d}" for m in range(0, 60, 5)],
+            state="readonly", width=4,
+        ).pack(side="left", padx=(2, 0))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Button(btn_row, text="创建/更新每日计划任务", command=self._create_schedule).pack(side="left")
+        ttk.Button(btn_row, text="立即手动运行一次", command=self._run_schedule_now).pack(side="left", padx=(8, 0))
+
+        self.schedule_status_label = ttk.Label(frame, text="", foreground="#888")
+        self.schedule_status_label.pack(anchor="w", padx=8, pady=(2, 4))
+
+        ttk.Label(
+            frame, foreground="#888", justify="left", wraplength=600,
+            text=(
+                "点「创建/更新每日计划任务」会用上面填的时间自动建好计划任务，之后每天到点自动运行，不需要再打开这个向导。\n"
+                "想手动触发（不等到点）：点上面「立即手动运行一次」，或者打开「任务计划程序」找到这个任务名右键「运行」，"
+                "或者命令行执行 schtasks /run /tn \"" + TASK_NAME_DEFAULT + "\"。"
+            ),
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+
+    def _create_schedule(self):
+        task_name = self.task_name_var.get().strip()
+        if not task_name:
+            messagebox.showerror("错误", "任务名称不能为空")
+            return
+        if not os.path.exists(RUN_HIDDEN_VBS_PATH):
+            messagebox.showerror("错误", f"找不到 {RUN_HIDDEN_VBS_PATH}，请确认这个向导和 run_hidden.vbs 在同一个项目文件夹下")
+            return
+        hh, mm = int(self.hour_var.get()), int(self.minute_var.get())
+        result = create_or_update_daily_task(task_name, hh, mm)
+        if result.returncode == 0:
+            self.schedule_status_label.config(
+                text=f"已设置：每天 {hh:02d}:{mm:02d} 自动运行「{task_name}」", foreground="#2a2",
+            )
+        else:
+            self.schedule_status_label.config(text=f"创建失败：{result.stderr.strip()}", foreground="#c00")
+
+    def _run_schedule_now(self):
+        task_name = self.task_name_var.get().strip()
+        result = run_task_now(task_name)
+        if result.returncode == 0:
+            self.schedule_status_label.config(text=f"已触发「{task_name}」立即运行", foreground="#2a2")
+        else:
+            self.schedule_status_label.config(
+                text=f"触发失败：{result.stderr.strip()}（可能是任务还没创建，先点上面的创建按钮）",
+                foreground="#c00",
+            )
 
     # ---------------- 保存 ----------------
     def _build_bottom_buttons(self):

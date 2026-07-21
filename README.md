@@ -42,7 +42,7 @@
    python setup_wizard.py
    ```
 
-   向导里可以添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义）、填 API Key、选 Whisper 模型大小并直接点按钮下载，保存后自动生成 `config.json` 并把 API Key 写入 Windows 环境变量。
+   向导里可以添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义）、填 API Key、选 Whisper 模型大小并直接点按钮下载，还能直接设置/更新每日自动运行的时间点（自动帮你建好 Windows 计划任务，不用再去任务计划程序里手动配置），保存后自动生成 `config.json` 并把 API Key 写入 Windows 环境变量。
 
 4. 如果没用上面的向导，手动设置翻译服务的 API Key 环境变量（默认是 `DEEPSEEK_API_KEY`，具体看你 `config.json` 里的 `translation.api_key_env`）：
 
@@ -78,10 +78,12 @@
 
 ## 设置每日自动运行（Windows 计划任务）
 
+最简单的方式是用 `setup_wizard.py` 里的「每日自动运行」区块，选好时间点点「创建/更新每日计划任务」就行，不用手动去任务计划程序里配置。也可以自己手动建：
+
 1. 打开「任务计划程序」，新建任务
 2. 触发器设成你想要的时间（比如每天早上10点）
 3. 操作设成启动程序，目标填 `run_hidden.vbs` 的完整路径（这个文件会静默运行、不弹黑框）
-4. 保存后可以在任务计划程序里右键「运行」手动测试一次
+4. 保存后可以在任务计划程序里右键「运行」手动测试一次，或者命令行执行 `schtasks /run /tn "任务名"`
 
 `run_hidden.vbs` → `run_daily.bat`（设置好 Python 环境的 PATH）→ `prompt_before_run.py`（弹确认通知，10分钟不操作自动开始）→ `daily_podcast.py`（真正干活）。项目文件夹整体挪动位置不需要改这几个脚本，只有计划任务里配置的目标路径需要跟着手动改一次。
 
