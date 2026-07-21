@@ -19,6 +19,11 @@ from tkinter import ttk
 import tkinter.font as tkfont
 from fullscreen_check import is_fullscreen_app_active
 
+# 默认走国内镜像下载Whisper模型，huggingface.co国内经常连不上/巨慢。用setdefault而不是直接
+# 赋值：如果用户自己已经设过HF_ENDPOINT（比如setx设成官方源或者别的镜像），尊重用户的选择，
+# 不覆盖。想换回官方源见README里的说明。
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 # 悬浮进度窗要清晰显示，必须在创建任何窗口前把进程标记为DPI感知，
 # 否则Windows会用位图整体拉伸缩放窗口来适配系统缩放比例，导致文字和边框发糊
 try:

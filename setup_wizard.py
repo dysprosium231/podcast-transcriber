@@ -21,6 +21,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from tqdm import tqdm
 
+# 默认走国内镜像下载Whisper模型，huggingface.co国内经常连不上/巨慢。用setdefault而不是直接
+# 赋值：如果用户自己已经设过HF_ENDPOINT，尊重用户的选择，不覆盖。想换回官方源见README里的说明。
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 # 界面文字发糊是没做DPI感知，Windows会用位图整体拉伸缩放窗口来适配系统缩放比例；
 # 必须在创建任何窗口前设置好，和 daily_podcast.py 的悬浮窗用的是同一个办法
 try:
