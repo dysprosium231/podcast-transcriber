@@ -7,6 +7,7 @@
 注意：setx 写的环境变量只对"之后新打开"的进程生效，当前正在运行的终端/程序需要重启才能读到。
 """
 import os
+import sys
 import json
 import subprocess
 import threading
@@ -14,11 +15,17 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from tqdm import tqdm
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # 打包成exe之后，__file__指向的是运行时解压的临时目录，不是exe真正所在的位置；
+    # sys.executable才是exe自己的路径，要用它来定位同目录下的config.json/episodes/等
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 RUN_HIDDEN_VBS_PATH = os.path.join(SCRIPT_DIR, "run_hidden.vbs")
 TASK_NAME_DEFAULT = "DailyPodcast"
+EPISODES_DIR = os.path.join(SCRIPT_DIR, "episodes")
 
 WHISPER_MODEL_CHOICES = [
     "tiny", "tiny.en", "base", "base.en", "small", "small.en",
@@ -131,11 +138,11 @@ def start_model_download(size, state):
 
 
 class SetupWizard:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("播客自动化 - 配置向导")
-        self.root.geometry("640x900")
-        self.root.resizable(False, False)
+    """「设置」页内容——可以直接当独立窗口用（自己有root），也可以塞进别的容器（比如Notebook的一个tab）里，
+    传进来的parent只要是个能当tk控件父容器的东西（Tk根窗口或者Frame都行）就可以"""
+
+    def __init__(self, parent):
+        self.parent = parent
 
         existing = load_existing_config()
         self.download_state = DownloadState()
@@ -148,7 +155,7 @@ class SetupWizard:
 
     # ---------------- 播客订阅 ----------------
     def _build_feeds_section(self, feeds):
-        frame = ttk.LabelFrame(self.root, text="播客订阅（节目名 + RSS地址）")
+        frame = ttk.LabelFrame(self.parent, text="播客订阅（节目名 + RSS地址）")
         frame.pack(fill="x", padx=12, pady=(12, 6))
 
         self.feeds_tree = ttk.Treeview(frame, columns=("name", "url"), show="headings", height=5)
@@ -188,7 +195,7 @@ class SetupWizard:
 
     # ---------------- 翻译服务 ----------------
     def _build_translation_section(self, translation):
-        frame = ttk.LabelFrame(self.root, text="翻译服务（OpenAI兼容接口，换服务商不用改代码）")
+        frame = ttk.LabelFrame(self.parent, text="翻译服务（OpenAI兼容接口，换服务商不用改代码）")
         frame.pack(fill="x", padx=12, pady=6)
 
         preset_row = ttk.Frame(frame)
@@ -251,7 +258,7 @@ class SetupWizard:
 
     # ---------------- Whisper模型 ----------------
     def _build_model_section(self, current_size):
-        frame = ttk.LabelFrame(self.root, text="Whisper 转录模型")
+        frame = ttk.LabelFrame(self.parent, text="Whisper 转录模型")
         frame.pack(fill="x", padx=12, pady=6)
 
         row = ttk.Frame(frame)
@@ -307,11 +314,11 @@ class SetupWizard:
             return
         if state.running:
             self.download_status_label.config(text=f"下载中... {state.desc}", foreground="#888")
-            self.root.after(200, self._poll_download)
+            self.parent.after(200, self._poll_download)
 
     # ---------------- 定时任务 ----------------
     def _build_schedule_section(self):
-        frame = ttk.LabelFrame(self.root, text="每日自动运行（Windows 计划任务）")
+        frame = ttk.LabelFrame(self.parent, text="每日自动运行（Windows 计划任务）")
         frame.pack(fill="x", padx=12, pady=6)
 
         row = ttk.Frame(frame)
@@ -388,10 +395,9 @@ class SetupWizard:
 
     # ---------------- 保存 ----------------
     def _build_bottom_buttons(self):
-        row = ttk.Frame(self.root)
+        row = ttk.Frame(self.parent)
         row.pack(fill="x", padx=12, pady=12)
         ttk.Button(row, text="保存配置", command=self._save).pack(side="right")
-        ttk.Button(row, text="关闭", command=self.root.destroy).pack(side="right", padx=(0, 8))
 
     def _save(self):
         feeds = {}
@@ -432,7 +438,141 @@ class SetupWizard:
         messagebox.showinfo("完成", msg)
 
 
+def scan_episodes():
+    """扫描 episodes/ 目录，返回 [(节目名, 期数标题, 文件夹绝对路径), ...]"""
+    result = []
+    if not os.path.isdir(EPISODES_DIR):
+        return result
+    for show_name in sorted(os.listdir(EPISODES_DIR)):
+        show_path = os.path.join(EPISODES_DIR, show_name)
+        if not os.path.isdir(show_path):
+            continue
+        for ep_title in sorted(os.listdir(show_path)):
+            ep_path = os.path.join(show_path, ep_title)
+            if os.path.isdir(ep_path):
+                result.append((show_name, ep_title, ep_path))
+    return result
+
+
+class HomeTab:
+    """播客库主页——浏览 episodes/ 下已经生成的节目，双击/点按钮直接打开字幕页、音频或所在文件夹，
+    不用自己去文件资源管理器里一层层找"""
+
+    def __init__(self, parent):
+        self.parent = parent
+
+        top = ttk.Frame(parent)
+        top.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Label(top, text="episodes/ 下已生成的节目", font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Button(top, text="刷新", command=self.refresh).pack(side="right")
+
+        self.tree = ttk.Treeview(parent, columns=("info",), show="tree headings", height=22)
+        self.tree.heading("#0", text="节目 / 期数")
+        self.tree.heading("info", text="")
+        self.tree.column("#0", width=440)
+        self.tree.column("info", width=140)
+        self.tree.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-1>", lambda e: self._open_subtitles())
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill="x", padx=12, pady=(0, 6))
+        self.open_subtitles_btn = ttk.Button(btn_row, text="打开字幕页", command=self._open_subtitles, state="disabled")
+        self.open_subtitles_btn.pack(side="left")
+        self.open_audio_btn = ttk.Button(btn_row, text="播放音频", command=self._open_audio, state="disabled")
+        self.open_audio_btn.pack(side="left", padx=(8, 0))
+        self.open_folder_btn = ttk.Button(btn_row, text="打开所在文件夹", command=self._open_folder, state="disabled")
+        self.open_folder_btn.pack(side="left", padx=(8, 0))
+
+        self.status_label = ttk.Label(parent, text="", foreground="#888")
+        self.status_label.pack(anchor="w", padx=12, pady=(0, 12))
+
+        self._node_paths = {}  # tree节点id -> 期数文件夹绝对路径（只有期数这一级节点才有）
+        self.refresh()
+
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        self._node_paths.clear()
+        episodes = scan_episodes()
+
+        shows = {}
+        for show_name, ep_title, ep_path in episodes:
+            shows.setdefault(show_name, []).append((ep_title, ep_path))
+
+        for show_name, eps in shows.items():
+            show_node = self.tree.insert("", "end", text=show_name, values=(f"{len(eps)} 期",), open=True)
+            for ep_title, ep_path in eps:
+                node = self.tree.insert(show_node, "end", text=ep_title, values=("",))
+                self._node_paths[node] = ep_path
+
+        if not episodes:
+            self.status_label.config(text="还没有生成任何一期——跑一次 daily_podcast.py 之后回来刷新看看")
+        else:
+            self.status_label.config(text=f"共 {len(shows)} 个节目、{len(episodes)} 期")
+
+        self._update_buttons_state()
+
+    def _selected_episode_path(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return self._node_paths.get(sel[0])
+
+    def _on_select(self, _event=None):
+        self._update_buttons_state()
+
+    def _update_buttons_state(self):
+        path = self._selected_episode_path()
+        has_subtitles = bool(path) and os.path.exists(os.path.join(path, "subtitles.html"))
+        has_audio = bool(path) and os.path.exists(os.path.join(path, "audio.mp3"))
+        self.open_subtitles_btn.config(state="normal" if has_subtitles else "disabled")
+        self.open_audio_btn.config(state="normal" if has_audio else "disabled")
+        self.open_folder_btn.config(state="normal" if path else "disabled")
+
+    def _open_subtitles(self):
+        path = self._selected_episode_path()
+        if not path:
+            return
+        target = os.path.join(path, "subtitles.html")
+        if os.path.exists(target):
+            os.startfile(target)
+
+    def _open_audio(self):
+        path = self._selected_episode_path()
+        if not path:
+            return
+        target = os.path.join(path, "audio.mp3")
+        if os.path.exists(target):
+            os.startfile(target)
+
+    def _open_folder(self):
+        path = self._selected_episode_path()
+        if path:
+            os.startfile(path)
+
+
+class App:
+    """顶层窗口：一个「播客库」主页 + 一个「设置」页（原来的配置向导），用Notebook切换"""
+
+    def __init__(self, root):
+        self.root = root
+        root.title("播客自动化")
+        root.geometry("720x950")
+        root.resizable(False, False)
+
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill="both", expand=True)
+
+        home_tab = ttk.Frame(notebook)
+        settings_tab = ttk.Frame(notebook)
+        notebook.add(home_tab, text="播客库")
+        notebook.add(settings_tab, text="设置")
+
+        HomeTab(home_tab)
+        SetupWizard(settings_tab)
+
+
 if __name__ == "__main__":
     root = tk.Tk()
-    SetupWizard(root)
+    App(root)
     root.mainloop()

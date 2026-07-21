@@ -10,6 +10,7 @@
 - **可插拔翻译服务商**：翻译走 OpenAI 兼容接口，DeepSeek / OpenAI / Moonshot / 智谱等大部分服务商都能直接用，改配置就行，不用改代码
 - **原生桌面反馈**：Windows Toast 通知 + 自绘悬浮进度窗（转圈等待 → 下载/转录/翻译进度条 → 完成变绿），不是网页或命令行输出
 - **双语字幕播放页**：生成的 `subtitles.html` 带音频播放器，点哪句字幕就跳到哪句，中英对照
+- **图形化管理界面**：`setup_wizard.py`（或打包好的 `podcast-manager.exe`）——「播客库」页签浏览/打开已生成的节目，「设置」页签管理订阅、翻译服务商、Whisper 模型下载、每日计划任务，不用手动改配置文件
 
 ## 环境要求
 
@@ -36,20 +37,22 @@
    copy config.example.json config.json
    ```
 
-   编辑 `config.json`（见下方「配置说明」），或者用图形化向导代替手动改 JSON + 设环境变量：
+   编辑 `config.json`（见下方「配置说明」），或者用图形界面代替手动改 JSON + 设环境变量：
 
    ```bat
    python setup_wizard.py
    ```
 
-   或者不装 Python 也能用：去 [Releases](../../releases) 页面下载打包好的 `podcast-setup-wizard.exe`，双击直接打开（这个 exe 只是配置向导，真正跑转录/翻译的 `daily_podcast.py` 还是需要上面装好的 Python 环境）。
+   或者不装 Python 也能用：去 [Releases](../../releases) 页面下载打包好的 `podcast-manager.exe`，放在项目根目录（跟 `config.json`、`episodes/` 同一层）双击直接打开（这个 exe 只是管理界面，真正跑转录/翻译的 `daily_podcast.py` 还是需要上面装好的 Python 环境）。
 
-   向导里可以添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义）、填 API Key、选 Whisper 模型大小并直接点按钮下载，还能直接设置/更新每日自动运行的时间点（自动帮你建好 Windows 计划任务，不用再去任务计划程序里手动配置），保存后自动生成 `config.json` 并把 API Key 写入 Windows 环境变量。
+   界面分两个页签：
+   - **播客库**：浏览 `episodes/` 下已经生成的节目，双击（或选中后点按钮）直接打开某一期的字幕页 / 播放音频 / 打开所在文件夹，不用自己去文件资源管理器里翻
+   - **设置**：添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义）、填 API Key、选 Whisper 模型大小并点按钮下载（带进度条）、设置每天几点自动运行并一键创建/更新 Windows 计划任务。保存后自动生成 `config.json`，API Key 写入 Windows 环境变量
 
    自己重新打包 exe：`pip install pyinstaller` 之后跑
 
    ```bat
-   pyinstaller --onefile --windowed --name podcast-setup-wizard setup_wizard.py ^
+   pyinstaller --onefile --windowed --name podcast-manager setup_wizard.py ^
      --add-binary "<conda环境>\Library\bin\tcl86t.dll;." ^
      --add-binary "<conda环境>\Library\bin\tk86t.dll;." ^
      --add-binary "<conda环境>\Library\bin\liblzma.dll;." ^
@@ -95,7 +98,7 @@
 
 ## 设置每日自动运行（Windows 计划任务）
 
-最简单的方式是用 `setup_wizard.py` 里的「每日自动运行」区块，选好时间点点「创建/更新每日计划任务」就行，不用手动去任务计划程序里配置。也可以自己手动建：
+最简单的方式是用 `setup_wizard.py`（或者 `podcast-manager.exe`）「设置」页里的「每日自动运行」区块，选好时间点点「创建/更新每日计划任务」就行，不用手动去任务计划程序里配置。也可以自己手动建：
 
 1. 打开「任务计划程序」，新建任务
 2. 触发器设成你想要的时间（比如每天早上10点）
