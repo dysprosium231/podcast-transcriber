@@ -756,6 +756,7 @@ def main():
     # 这样"今天两个节目都没更新"的最常见情况就不用白等1-2分钟的GPU模型加载
     model = None
     batched_model = None
+    showed_click_to_open = False
 
     for show_name, rss_url in FEEDS.items():
         print(f"\n--- Checking {show_name} ---")
@@ -819,12 +820,23 @@ def main():
 
             progress.finish("已完成，点击查看")
             notify_click_to_open(f"「{show_name}」有新一期", current_title[:60], html_path)
+            showed_click_to_open = True
 
         except Exception as e:
             print(f"Processing failed: {e}")
             progress.finish(f"处理失败: {e}"[:60])
             notify_simple(f"「{show_name}」处理失败", f"{current_title[:40]}：{e}"[:100])
             continue
+
+    if showed_click_to_open:
+        # notify_click_to_open的点击回调是靠这个python进程自己活着去接WinRT的激活事件——
+        # 这里没有给应用注册真正的AUMID/激活器（那是普通装好的软件才有的，需要一整套
+        # 快捷方式+注册表/COM设置），进程一退出，回调就彻底没人接了。main()跑完这里
+        # 马上就要os._exit()，如果不等一下，通知刚弹出来、用户还没来得及点，进程已经死了，
+        # 点了也没反应——之前真实测试就是这么复现的。这里等一下不能保证100%（用户几分钟后
+        # 从操作中心里点还是会失效），但比"进程立刻退出、点了必然没反应"好得多。
+        print("Waiting a bit before exit so the completion notification stays clickable...")
+        time.sleep(8)
 
     print(f"\n=== RUN END {datetime.now()} ===")
 
