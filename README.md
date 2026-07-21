@@ -43,7 +43,7 @@
    python setup_wizard.py
    ```
 
-   或者不装 Python 也能用：去 [Releases](../../releases) 页面下载打包好的 `podcast-manager.exe`（体积大概100MB，打包了转录/翻译要用到的库），放在项目根目录（跟 `config.json`、`episodes/` 同一层）双击直接打开。
+   或者不装 Python 也能用：去 [Releases](../../releases) 页面下载打包好的 `podcast-manager.exe`（体积大概36MB），放在项目根目录（跟 `config.json`、`episodes/` 同一层）双击直接打开。这个界面本身很轻量（只有tkinter+网络请求），**不直接跑转录/翻译**——那部分工作交给「设置」页里指定的真实Python环境（比如 `run_daily.bat` 用的那个conda环境）以子进程方式执行，所以界面启动快、体积小，也不存在"exe里缺CUDA库"这种问题。首次打开exe时Windows可能会先做一次安全扫描，等个几秒到几十秒，之后再打开就快了（几秒钟）。
 
    界面分三个页签：
    - **播客库**：浏览 `episodes/` 下已经生成的节目，双击（或选中后点按钮）直接打开某一期的字幕页 / 播放音频 / 打开所在文件夹，不用自己去文件资源管理器里翻
@@ -52,8 +52,8 @@
      - **RSS历史下载**：把某个节目（或临时粘贴一个不在订阅列表里的RSS地址）的完整历史列出来，勾选任意几期批量下载+处理，不再局限于"只能拿到最新一期"
      - **批量本地导入**：选一个文件夹或zip压缩包，里面一堆mp3/m4a/wav等音频（比如非RSS渠道拿到的本地播客归档），逐个建文件夹处理，标题默认取文件名
      
-     批量场景（RSS历史/本地导入）选中多项会排队顺序处理（GPU转录本来就没法并行），可以随时点「取消剩余排队项」；已经处理过的期数重新选中会在开始前一次性弹窗询问是否覆盖，不会一项项打断。**注意**：独立exe版本没有打包 CUDA 运行库（cublas/cudnn 加起来有1.7GB，打包不现实），这几个功能在独立exe下需要电脑上本来就有能被系统找到的CUDA环境才能跑GPU转录；更省心的做法是用 `python setup_wizard.py` 在项目自带的conda环境里运行，不受这个限制
-   - **设置**：添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义，也可以直接输入自定义服务商名称）、填 API Key、选 Whisper 模型大小并点按钮下载（带进度条）、设置每天几点自动运行并一键创建/更新 Windows 计划任务（可以勾选/取消勾选来启用或禁用）。保存后自动生成 `config.json`，API Key 写入 Windows 环境变量，界面内容始终和 `config.json` 保持同步（切页签、点「重新加载」都会重新按文件内容刷新）
+     批量场景（RSS历史/本地导入）选中多项会排队顺序处理（GPU转录本来就没法并行），可以随时点「取消剩余排队项」；已经处理过的期数重新选中会在开始前一次性弹窗询问是否覆盖，不会一项项打断。
+   - **设置**：添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义，也可以直接输入自定义服务商名称）、填 API Key、选 Whisper 模型大小并点按钮下载（带进度条）、指定"运行环境"（真实Python解释器路径，留空会自动从 `run_daily.bat` 里探测）、设置每天几点自动运行并一键创建/更新 Windows 计划任务（可以勾选/取消勾选来启用或禁用）。保存后自动生成 `config.json`，API Key 写入 Windows 环境变量，界面内容始终和 `config.json` 保持同步（切页签、点「重新加载」都会重新按文件内容刷新）
 
    自己重新打包 exe：`pip install pyinstaller` 之后跑
 
@@ -90,6 +90,8 @@
     "节目显示名": "RSS地址"
   },
   "whisper_model_size": "large-v3",  // 对应 models/ 下的文件夹名
+  "python_exe": "",                  // 可选：手动处理用来跑转录/翻译的真实python.exe路径，
+                                      // 留空会自动从 run_daily.bat 的 CONDA_ENV 探测
   "translation": {
     "provider_name": "DeepSeek",           // 只用于日志/展示
     "base_url": "https://api.deepseek.com", // OpenAI兼容接口地址

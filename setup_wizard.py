@@ -8,13 +8,15 @@ Whisper 模型下载、每日计划任务。生成/更新 config.json；API Key 
 注意：setx 写的环境变量只对"之后新打开"的进程生效，当前正在运行的终端/程序需要重启才能读到。
 """
 import os
+import re
 import sys
 import json
 import ctypes
-import shutil
 import zipfile
 import subprocess
 import threading
+import feedparser
+import requests
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from tqdm import tqdm
@@ -38,8 +40,14 @@ else:
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
 RUN_HIDDEN_VBS_PATH = os.path.join(SCRIPT_DIR, "run_hidden.vbs")
+RUN_DAILY_BAT_PATH = os.path.join(SCRIPT_DIR, "run_daily.bat")
+DAILY_PODCAST_PATH = os.path.join(SCRIPT_DIR, "daily_podcast.py")
 TASK_NAME_DEFAULT = "DailyPodcast"
 EPISODES_DIR = os.path.join(SCRIPT_DIR, "episodes")
+
+RSS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
 
 WHISPER_MODEL_CHOICES = [
     "tiny", "tiny.en", "base", "base.en", "small", "small.en",
@@ -81,14 +89,14 @@ def apply_modern_style(root):
     style = ttk.Style(root)
     style.theme_use("clam")
 
-    style.configure(".", background=COLORS["bg"], foreground=COLORS["fg"], font=("Segoe UI", 9))
+    style.configure(".", background=COLORS["bg"], foreground=COLORS["fg"], font=("Segoe UI", 10))
     style.configure("TFrame", background=COLORS["bg"])
     style.configure("TLabel", background=COLORS["bg"], foreground=COLORS["fg"])
     style.configure("Muted.TLabel", background=COLORS["bg"], foreground=COLORS["fg_muted"])
     style.configure("Success.TLabel", background=COLORS["bg"], foreground=COLORS["success"])
     style.configure("Danger.TLabel", background=COLORS["bg"], foreground=COLORS["danger"])
     style.configure("Warning.TLabel", background=COLORS["bg"], foreground=COLORS["warning"])
-    style.configure("Heading.TLabel", background=COLORS["bg"], foreground=COLORS["fg"], font=("Segoe UI", 10, "bold"))
+    style.configure("Heading.TLabel", background=COLORS["bg"], foreground=COLORS["fg"], font=("Segoe UI", 12, "bold"))
 
     style.configure(
         "TLabelframe", background=COLORS["bg"], bordercolor=COLORS["border"],
@@ -96,12 +104,12 @@ def apply_modern_style(root):
     )
     style.configure(
         "TLabelframe.Label", background=COLORS["bg"], foreground=COLORS["fg"],
-        font=("Segoe UI", 10, "bold"),
+        font=("Segoe UI", 11, "bold"),
     )
 
     style.configure(
         "TButton", background=COLORS["field_bg"], foreground=COLORS["fg"],
-        borderwidth=0, focuscolor=COLORS["bg"], padding=(10, 6),
+        borderwidth=0, focuscolor=COLORS["bg"], padding=(11, 7), font=("Segoe UI", 10),
     )
     style.map(
         "TButton",
@@ -111,7 +119,7 @@ def apply_modern_style(root):
 
     style.configure(
         "Accent.TButton", background=COLORS["accent"], foreground="#ffffff",
-        borderwidth=0, focuscolor=COLORS["bg"], padding=(12, 7), font=("Segoe UI", 9, "bold"),
+        borderwidth=0, focuscolor=COLORS["bg"], padding=(13, 8), font=("Segoe UI", 10, "bold"),
     )
     style.map(
         "Accent.TButton",
@@ -143,11 +151,11 @@ def apply_modern_style(root):
 
     style.configure(
         "Treeview", background=COLORS["field_bg"], fieldbackground=COLORS["field_bg"],
-        foreground=COLORS["fg"], borderwidth=0, rowheight=26,
+        foreground=COLORS["fg"], borderwidth=0, rowheight=30, font=("Segoe UI", 10),
     )
     style.configure(
         "Treeview.Heading", background=COLORS["bg_elevated"], foreground=COLORS["fg"],
-        borderwidth=0, relief="flat", font=("Segoe UI", 9, "bold"),
+        borderwidth=0, relief="flat", font=("Segoe UI", 10, "bold"),
     )
     style.map(
         "Treeview",
@@ -165,13 +173,13 @@ def apply_modern_style(root):
     style.configure("TNotebook", background=COLORS["bg_elevated"], bordercolor=COLORS["border"], borderwidth=0)
     style.configure(
         "TNotebook.Tab", background=COLORS["bg_elevated"], foreground=COLORS["fg_muted"],
-        padding=(22, 11), font=("Segoe UI", 10), borderwidth=0,
+        padding=(24, 12), font=("Segoe UI", 11), borderwidth=0,
     )
     style.map(
         "TNotebook.Tab",
         background=[("selected", COLORS["bg"])],
         foreground=[("selected", COLORS["accent"])],
-        font=[("selected", ("Segoe UI", 10, "bold"))],
+        font=[("selected", ("Segoe UI", 11, "bold"))],
     )
 
 
@@ -202,9 +210,9 @@ def make_checkmark_toggle(parent, text, variable, command=None):
         if command:
             command()
 
-    box = tk.Label(frame, font=("Segoe UI", 12), bg=COLORS["bg"], cursor="hand2")
+    box = tk.Label(frame, font=("Segoe UI", 13), bg=COLORS["bg"], cursor="hand2")
     box.pack(side="left")
-    label = tk.Label(frame, text=text, bg=COLORS["bg"], fg=COLORS["fg"], font=("Segoe UI", 9), cursor="hand2")
+    label = tk.Label(frame, text=text, bg=COLORS["bg"], fg=COLORS["fg"], font=("Segoe UI", 10), cursor="hand2")
     label.pack(side="left", padx=(4, 0))
 
     box.bind("<Button-1>", on_click)
@@ -356,6 +364,7 @@ class SetupWizard:
         self._build_feeds_section()
         self._build_translation_section()
         self._build_model_section()
+        self._build_runtime_section()
         self._build_schedule_section()
         self._build_bottom_buttons()
 
@@ -369,6 +378,7 @@ class SetupWizard:
         self._populate_translation(config.get("translation", {}))
         self.model_size_var.set(config.get("whisper_model_size", "large-v3"))
         self._refresh_model_status()
+        self.python_exe_var.set(config.get("python_exe", ""))
         self._refresh_schedule_from_task()
 
     def _populate_feeds(self, feeds):
@@ -472,7 +482,7 @@ class SetupWizard:
         ).pack(anchor="w", padx=10, pady=(0, 6))
 
         ttk.Label(frame, text="补充翻译提示（可选，比如专有名词纠错说明）").pack(anchor="w", padx=10)
-        self.extra_prompt_text = tk.Text(frame, height=3, width=70)
+        self.extra_prompt_text = tk.Text(frame, height=3, width=70, font=("Segoe UI", 10))
         style_text_widget(self.extra_prompt_text)
         self.extra_prompt_text.pack(padx=10, pady=(4, 10))
 
@@ -546,6 +556,43 @@ class SetupWizard:
         if state.running:
             self.download_status_label.config(text=f"下载中... {state.desc}", style="Muted.TLabel")
             self.parent.after(200, self._poll_download)
+
+    # ---------------- 运行环境 ----------------
+    def _build_runtime_section(self):
+        frame = ttk.LabelFrame(self.parent, text="运行环境（手动处理用来跑转录/翻译的Python）")
+        frame.pack(fill="x", padx=14, pady=7)
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x", padx=10, pady=10)
+        self.python_exe_var = tk.StringVar()
+        ttk.Entry(row, textvariable=self.python_exe_var, width=50).pack(side="left")
+        ttk.Button(row, text="浏览...", command=self._browse_python_exe).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="自动检测", command=self._auto_detect_python_exe).pack(side="left", padx=(6, 0))
+
+        self.runtime_status_label = ttk.Label(frame, text="", style="Muted.TLabel")
+        self.runtime_status_label.pack(anchor="w", padx=10, pady=(0, 5))
+
+        ttk.Label(
+            frame, style="Muted.TLabel", wraplength=680, justify="left",
+            text=(
+                "「手动处理」页签的转录/翻译不在这个界面自己的进程里跑，而是把任务交给这里指定的"
+                "Python解释器（装了faster-whisper等依赖的那个环境，比如conda环境里的python.exe）"
+                "当独立子进程执行。留空的话会尝试自动从 run_daily.bat 里读取。"
+            ),
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+    def _browse_python_exe(self):
+        path = filedialog.askopenfilename(title="选择python.exe", filetypes=[("python.exe", "python.exe"), ("所有文件", "*.*")])
+        if path:
+            self.python_exe_var.set(path)
+
+    def _auto_detect_python_exe(self):
+        found = find_python_exe(prefer_config=False)
+        if found:
+            self.python_exe_var.set(found)
+            self.runtime_status_label.config(text=f"检测到：{found}", style="Success.TLabel")
+        else:
+            self.runtime_status_label.config(text="没有自动检测到，请点「浏览...」手动选择", style="Warning.TLabel")
 
     # ---------------- 定时任务 ----------------
     def _build_schedule_section(self):
@@ -682,6 +729,7 @@ class SetupWizard:
         return {
             "feeds": feeds,
             "whisper_model_size": self.model_size_var.get(),
+            "python_exe": self.python_exe_var.get().strip(),
             "translation": {
                 "provider_name": self.preset_var.get(),
                 "base_url": self.base_url_var.get().strip(),
@@ -836,25 +884,65 @@ AUDIO_FILE_TYPES = [
 ]
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".wma"}
 
-# 手动处理跟每天自动跑的daily_podcast.py共用同一套转录/翻译逻辑（不重新写一遍，靠导入复用），
-# 模型在同一次程序运行里只加载一次，不管是单个文件、RSS历史下载还是批量本地导入，重复处理
-# 多个音频都不用每次都等GPU模型重新加载
-_manual_model = None
-_manual_batched_model = None
+# 手动处理不在这个界面自己的进程里跑转录/翻译——那样会逼着GUI也打包faster-whisper/ctranslate2
+# 这些体积巨大又依赖CUDA运行库的东西。而是调用真实python环境（比如conda环境）里的
+# daily_podcast.py 作为独立子进程，通过它逐行往stdout打JSON汇报进度，这里解析读取。
+# 界面进程本身保持轻量，也彻底不会有"打包的exe里缺CUDA DLL"这种问题。
+_PY_EXE_CACHE = None
 
 
-def _wrap_gpu_error(e):
-    """打包成exe之后不会带CUDA运行库（cublas/cudnn加起来有1.7GB，打包不现实），
-    手动处理这几个功能在独立exe下需要电脑上本来就有能被找到的CUDA运行环境；
-    用 python setup_wizard.py 在项目自带的conda环境里跑就没有这个限制"""
-    if getattr(sys, "frozen", False) and any(k in str(e).lower() for k in ("dll", "cublas", "cudnn")):
-        return RuntimeError(
-            "GPU模型加载失败，缺少CUDA运行库（cublas/cudnn等）。"
-            "这是独立exe的已知限制——这些库总共1.7GB左右，没有打包进exe。"
-            "这个功能建议用 `python setup_wizard.py` 在装好conda环境的电脑上运行，不受这个限制。"
-            f"\n\n原始错误：{e}"
-        )
-    return e
+def sanitize_filename(title):
+    """跟daily_podcast.py里的同名函数逻辑一致——就是这么短，直接抄一份，不为这一个函数去
+    导入整个daily_podcast.py（那样会把它的faster-whisper等重量级依赖也带进GUI进程）"""
+    return re.sub(r'[\\/*?:"<>|]', "", title)[:80]
+
+
+def find_python_exe(prefer_config=True):
+    """找一个装好了转录/翻译依赖的真实python解释器（不是这个GUI程序自己）。
+    优先级：config.json里显式指定 > 解析run_daily.bat里的CONDA_ENV > 如果不是打包的exe、
+    自己本来就在正确的环境里运行，直接用自己"""
+    if prefer_config:
+        config = load_existing_config()
+        explicit = config.get("python_exe", "").strip()
+        if explicit and os.path.exists(explicit):
+            return explicit
+
+    if os.path.exists(RUN_DAILY_BAT_PATH):
+        try:
+            with open(RUN_DAILY_BAT_PATH, "r", encoding="utf-8") as f:
+                content = f.read()
+            m = re.search(r"set\s+CONDA_ENV=(.+)", content, re.IGNORECASE)
+            if m:
+                candidate = os.path.join(m.group(1).strip(), "python.exe")
+                if os.path.exists(candidate):
+                    return candidate
+        except Exception:
+            pass
+
+    if not getattr(sys, "frozen", False):
+        return sys.executable  # 用 python setup_wizard.py 运行时，自己就在正确的环境里
+
+    return None
+
+
+def build_subprocess_env(python_exe):
+    """给子进程准备PATH，跟run_daily.bat里设置的一样，让faster-whisper能找到cublas/cudnn等DLL"""
+    conda_env = os.path.dirname(python_exe)
+    env = os.environ.copy()
+    prefix = os.pathsep.join([
+        conda_env,
+        os.path.join(conda_env, "Library", "mingw-w64", "bin"),
+        os.path.join(conda_env, "Library", "usr", "bin"),
+        os.path.join(conda_env, "Library", "bin"),
+        os.path.join(conda_env, "Scripts"),
+        os.path.join(conda_env, "bin"),
+    ])
+    env["PATH"] = prefix + os.pathsep + env.get("PATH", "")
+    # 子进程的stdout被重定向成管道时，Python默认按系统区域设置的编码写（中文Windows是GBK），
+    # 而这边父进程读的时候固定按UTF-8解码——两边编码对不上，中文进度文字/标题就会被读乱。
+    # 强制子进程stdio走UTF-8，跟父进程解码方式对齐
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 class BatchJob:
@@ -883,21 +971,17 @@ class BatchState:
         self.item_progress = 0.0
 
 
-def episode_target_dir(dp, job):
-    safe_title = dp.sanitize_filename(job.episode_title)
+def episode_target_dir(job):
+    safe_title = sanitize_filename(job.episode_title)
     return os.path.join(EPISODES_DIR, job.show_name, safe_title)
 
 
 def check_conflicts(jobs):
     """处理开始前一次性检查哪些目标文件夹已经存在（已经处理过），用于批量询问是否覆盖，
     而不是一项项弹窗打断"""
-    try:
-        import daily_podcast as dp
-    except Exception:
-        return []
     conflicts = []
     for job in jobs:
-        episode_dir = episode_target_dir(dp, job)
+        episode_dir = episode_target_dir(job)
         if os.path.exists(os.path.join(episode_dir, "subtitles.html")):
             conflicts.append(job)
     return conflicts
@@ -923,62 +1007,54 @@ def confirm_and_filter_conflicts(jobs):
     return [j for j in jobs if id(j) not in conflict_ids]
 
 
-def _process_one_job(dp, job, on_stage):
-    global _manual_model, _manual_batched_model
-
-    episode_dir = episode_target_dir(dp, job)
-    os.makedirs(episode_dir, exist_ok=True)
-
-    if job.source_type == "local":
-        ext = os.path.splitext(job.source)[1] or ".mp3"
-        audio_filename = f"audio{ext}"
-        audio_dest = os.path.join(episode_dir, audio_filename)
-        on_stage("复制音频文件...", 0.05)
-        shutil.copyfile(job.source, audio_dest)
-        on_stage("准备转录...", 0.2)
-    elif job.source_type == "zip":
+def _process_one_job(python_exe, job, on_stage):
+    """把这一项任务扔给真实python环境里的daily_podcast.py当子进程处理，
+    从它逐行打的JSON里读进度；不在GUI自己的进程里碰任何转录/翻译代码"""
+    if job.source_type == "zip":
         zip_path, entry_name = job.source
-        ext = os.path.splitext(entry_name)[1] or ".mp3"
-        audio_filename = f"audio{ext}"
-        audio_dest = os.path.join(episode_dir, audio_filename)
-        on_stage("解压音频文件...", 0.05)
-        with zipfile.ZipFile(zip_path) as zf, zf.open(entry_name) as src, open(audio_dest, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        on_stage("准备转录...", 0.2)
-    else:  # download
-        audio_filename = "audio.mp3"
-        audio_dest = os.path.join(episode_dir, audio_filename)
-        dp.download_audio(
-            job.source, audio_dest,
-            on_progress=lambda p: on_stage(f"下载中 {int(p * 100)}%", p * 0.2),
-        )
+        source_arg = f"{zip_path}::{entry_name}"
+    else:
+        source_arg = job.source
 
-    if _manual_model is None:
-        on_stage("正在加载GPU模型（首次可能需要1-2分钟）...", 0.2)
+    args = [
+        python_exe, DAILY_PODCAST_PATH, "--manual-job",
+        "--show", job.show_name, "--title", job.episode_title,
+        "--source-type", job.source_type, "--source", source_arg,
+    ]
+    env = build_subprocess_env(python_exe)
+    proc = subprocess.Popen(
+        args, cwd=SCRIPT_DIR, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+    result_dir = None
+    error_msg = None
+    tail_lines = []
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
         try:
-            _manual_model = dp.WhisperModel(dp.MODEL_PATH, device="cuda", compute_type="float16")
-            _manual_batched_model = dp.BatchedInferencePipeline(model=_manual_model)
-        except Exception as e:
-            raise _wrap_gpu_error(e)
+            msg = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            tail_lines.append(line)  # tqdm之类的普通日志行，不是JSON，留着万一失败时给用户看
+            continue
+        if "error" in msg:
+            error_msg = msg["error"]
+        elif msg.get("done"):
+            result_dir = msg.get("result_dir")
+        else:
+            on_stage(msg.get("stage", ""), msg.get("progress", 0.0))
 
-    segments = dp.transcribe_audio(
-        _manual_batched_model, audio_dest,
-        on_progress=lambda p: on_stage(f"转录中 {int(p * 100)}%", 0.2 + p * 0.6),
-    )
-    segments = dp.translate_segments(
-        segments,
-        on_progress=lambda p: on_stage(f"翻译中 {int(p * 100)}%", 0.8 + p * 0.2),
-    )
-
-    with open(os.path.join(episode_dir, "data.json"), "w", encoding="utf-8") as f:
-        json.dump(segments, f, ensure_ascii=False, indent=2)
-    dp.save_text_files(
-        segments,
-        os.path.join(episode_dir, "transcript_en.txt"),
-        os.path.join(episode_dir, "transcript_zh.txt"),
-    )
-    dp.generate_html(job.episode_title, audio_filename, segments, os.path.join(episode_dir, "subtitles.html"))
-    return episode_dir
+    proc.wait()
+    if error_msg:
+        raise RuntimeError(error_msg)
+    if proc.returncode != 0 or not result_dir:
+        tail = "\n".join(tail_lines[-15:])
+        raise RuntimeError(f"子进程处理失败（退出码 {proc.returncode}）：{tail or '没有更多输出信息'}")
+    return result_dir
 
 
 def run_batch(jobs, state):
@@ -992,19 +1068,11 @@ def run_batch(jobs, state):
     state.item_progress = 0.0
 
     def worker():
-        try:
-            import daily_podcast as dp
-        except FileNotFoundError:
+        python_exe = find_python_exe()
+        if not python_exe:
             for j in jobs:
                 j.status = "失败"
-                j.error = "找不到 config.json，请先在「设置」页保存一次配置"
-            state.running = False
-            state.done = True
-            return
-        except Exception as e:
-            for j in jobs:
-                j.status = "失败"
-                j.error = f"加载主程序模块失败：{e}"
+                j.error = "找不到可用的Python环境，请到「设置」页的「运行环境」里手动指定或自动检测"
             state.running = False
             state.done = True
             return
@@ -1022,7 +1090,7 @@ def run_batch(jobs, state):
                 state.item_progress = progress
 
             try:
-                job.result_dir = _process_one_job(dp, job, on_stage)
+                job.result_dir = _process_one_job(python_exe, job, on_stage)
                 job.status = "完成"
             except Exception as e:
                 job.status = "失败"
@@ -1292,19 +1360,16 @@ class RssHistoryPane:
         if not url:
             messagebox.showerror("错误", "请先选择已配置节目，或者自己填一个RSS地址")
             return
-        try:
-            import daily_podcast as dp
-        except FileNotFoundError:
-            messagebox.showerror("错误", "找不到 config.json，请先在「设置」页保存一次配置")
-            return
-        except Exception as e:
-            messagebox.showerror("错误", f"加载主程序模块失败：{e}")
-            return
 
         self.fetch_status_label.config(text="拉取中...", style="Muted.TLabel")
         self.parent.update_idletasks()
         try:
-            entries = dp.get_all_episodes(url)
+            # 跟daily_podcast.py的get_all_episodes同样的抓取方式（自己带超时，不让feedparser
+            # 直接拿URL），这里直接内联一遍而不是导入daily_podcast.py，避免GUI进程被迫
+            # 加载它那些转录/翻译相关的重量级依赖
+            r = requests.get(url, timeout=30, headers=RSS_HEADERS)
+            r.raise_for_status()
+            entries = feedparser.parse(r.content).entries
         except Exception as e:
             messagebox.showerror("错误", f"拉取RSS失败：{e}")
             self.fetch_status_label.config(text="", style="Muted.TLabel")
@@ -1506,7 +1571,7 @@ class App:
         apply_modern_style(root)  # 顺带设置好了DPI缩放
         root.title("播客自动化")
         scale = root.winfo_fpixels("1i") / 96.0
-        root.geometry(f"{int(760 * scale)}x{int(980 * scale)}")
+        root.geometry(f"{int(800 * scale)}x{int(1040 * scale)}")
         root.resizable(False, False)
 
         self.notebook = ttk.Notebook(root)

@@ -6,6 +6,8 @@ import re
 import time
 import json
 import ctypes
+import shutil
+import zipfile
 from datetime import datetime
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from openai import OpenAI
@@ -796,7 +798,90 @@ def main():
     print(f"\n=== RUN END {datetime.now()} ===")
 
 
+def _emit_json(payload):
+    """给手动任务模式用：按行往stdout打JSON，调用方（setup_wizard.py起的子进程）按行解析。
+    用flush=True保证父进程能实时读到，不会被缓冲卡住"""
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def run_manual_job(show_name, episode_title, source_type, source):
+    """手动任务模式的核心逻辑：不检查RSS、不循环多个节目，只处理指定的这一个音频。
+    被 setup_wizard.py 当独立子进程调用——这样GUI本身不需要打包faster-whisper/ctranslate2这些
+    体积巨大的转录依赖，也不用操心CUDA运行库有没有被打包进exe，因为跑的就是真实python环境。
+    source_type: "local"（本地文件路径）/ "download"（音频URL）/ "zip"（"zip路径::压缩包内条目名"）"""
+    show_dir = os.path.join(EPISODES_DIR, show_name)
+    os.makedirs(show_dir, exist_ok=True)
+    safe_title = sanitize_filename(episode_title)
+    episode_dir = os.path.join(show_dir, safe_title)
+    os.makedirs(episode_dir, exist_ok=True)
+
+    if source_type == "local":
+        ext = os.path.splitext(source)[1] or ".mp3"
+        audio_filename = f"audio{ext}"
+        audio_dest = os.path.join(episode_dir, audio_filename)
+        _emit_json({"stage": "复制音频文件...", "progress": 0.05})
+        shutil.copyfile(source, audio_dest)
+        _emit_json({"stage": "准备转录...", "progress": 0.2})
+    elif source_type == "zip":
+        zip_path, entry_name = source.split("::", 1)
+        ext = os.path.splitext(entry_name)[1] or ".mp3"
+        audio_filename = f"audio{ext}"
+        audio_dest = os.path.join(episode_dir, audio_filename)
+        _emit_json({"stage": "解压音频文件...", "progress": 0.05})
+        with zipfile.ZipFile(zip_path) as zf, zf.open(entry_name) as src, open(audio_dest, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        _emit_json({"stage": "准备转录...", "progress": 0.2})
+    else:  # download
+        audio_filename = "audio.mp3"
+        audio_dest = os.path.join(episode_dir, audio_filename)
+        download_audio(
+            source, audio_dest,
+            on_progress=lambda p: _emit_json({"stage": f"下载中 {int(p * 100)}%", "progress": p * 0.2}),
+        )
+
+    model = WhisperModel(MODEL_PATH, device="cuda", compute_type="float16")
+    batched_model = BatchedInferencePipeline(model=model)
+
+    segments = transcribe_audio(
+        batched_model, audio_dest,
+        on_progress=lambda p: _emit_json({"stage": f"转录中 {int(p * 100)}%", "progress": 0.2 + p * 0.6}),
+    )
+    segments = translate_segments(
+        segments,
+        on_progress=lambda p: _emit_json({"stage": f"翻译中 {int(p * 100)}%", "progress": 0.8 + p * 0.2}),
+    )
+
+    with open(os.path.join(episode_dir, "data.json"), "w", encoding="utf-8") as f:
+        json.dump(segments, f, ensure_ascii=False, indent=2)
+    save_text_files(
+        segments,
+        os.path.join(episode_dir, "transcript_en.txt"),
+        os.path.join(episode_dir, "transcript_zh.txt"),
+    )
+    generate_html(episode_title, audio_filename, segments, os.path.join(episode_dir, "subtitles.html"))
+    _emit_json({"done": True, "result_dir": episode_dir})
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--manual-job":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--manual-job", action="store_true")
+        parser.add_argument("--show", required=True)
+        parser.add_argument("--title", required=True)
+        parser.add_argument("--source-type", required=True, choices=["local", "download", "zip"])
+        parser.add_argument("--source", required=True)
+        cli_args = parser.parse_args()
+        try:
+            run_manual_job(cli_args.show, cli_args.title, cli_args.source_type, cli_args.source)
+        except Exception as e:
+            _emit_json({"error": str(e)})
+            sys.stdout.flush()
+            os._exit(1)
+        sys.stdout.flush()
+        os._exit(0)
+
     main()
     sys.stdout.flush()
     os._exit(0)
