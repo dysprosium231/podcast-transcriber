@@ -51,7 +51,11 @@ CONFIG = load_config()
 
 FEEDS = CONFIG["feeds"]  # {节目名: RSS地址}，节目名会用作文件夹名和通知里的显示名
 
-MODEL_PATH = os.path.join(SCRIPT_DIR, "models", CONFIG.get("whisper_model_size", "large-v3"))
+_WHISPER_MODEL_SIZE = CONFIG.get("whisper_model_size", "large-v3")
+_LOCAL_MODEL_DIR = os.path.join(SCRIPT_DIR, "models", _WHISPER_MODEL_SIZE)
+# 本地手动放好的模型文件夹优先用；不存在的话直接把模型名交给faster-whisper，
+# 它会自动从HuggingFace下载并缓存，新用户不需要手动下载/摆放模型文件
+MODEL_PATH = _LOCAL_MODEL_DIR if os.path.isdir(_LOCAL_MODEL_DIR) else _WHISPER_MODEL_SIZE
 EPISODES_DIR = "episodes"  # 结构: episodes/节目名/期数标题/
 LATEST_LOG = "latest_episodes.txt"
 

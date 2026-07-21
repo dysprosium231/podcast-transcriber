@@ -26,17 +26,9 @@
    pip install -r requirements.txt
    ```
 
-2. 下载一个 faster-whisper 格式（CTranslate2 转换过）的 Whisper 模型，放到 `models/<模型名>/` 下面，比如：
+2. Whisper 模型不需要手动下载——第一次运行时会根据 `config.json` 里的 `whisper_model_size` 自动从 Hugging Face 下载对应的 faster-whisper 模型并缓存，等着就行。显卡显存不够的话可以在配置里换小一点的模型（`medium`、`small`、`base.en` 等）。
 
-   ```
-   models/large-v3/
-     model.bin
-     config.json
-     tokenizer.json
-     vocabulary.json / vocabulary.txt
-   ```
-
-   模型可以从 Hugging Face 上的 `Systran/faster-whisper-<size>` 系列仓库下载（如 `Systran/faster-whisper-large-v3`），或者用 `huggingface-cli download` 拉取。显卡显存不够的话可以换小一点的模型（`medium`、`small`、`base.en` 等），文件夹名要和下一步 `config.json` 里的 `whisper_model_size` 对上。
+   如果你想手动指定模型文件（比如离线环境、或者已经下载好了别的来源的模型），把模型文件夹放到 `models/<模型名>/` 下面（需要包含 `model.bin`、`config.json`、`tokenizer.json`、`vocabulary.json` 等文件），程序会优先用本地文件夹，不会再走自动下载。
 
 3. 复制配置模板并按需修改：
 
