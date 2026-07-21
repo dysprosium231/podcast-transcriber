@@ -747,11 +747,11 @@ class HomeTab:
         ttk.Label(top, text="episodes/ 下已生成的节目", style="Heading.TLabel").pack(side="left")
         ttk.Button(top, text="刷新", command=self.refresh).pack(side="right")
 
-        self.tree = ttk.Treeview(parent, columns=("info",), show="tree headings", height=22)
-        self.tree.heading("#0", text="节目 / 期数")
-        self.tree.heading("info", text="")
-        self.tree.column("#0", width=440)
-        self.tree.column("info", width=140)
+        self.tree = ttk.Treeview(parent, columns=("show", "title"), show="headings", height=22)
+        self.tree.heading("show", text="节目")
+        self.tree.heading("title", text="期数标题")
+        self.tree.column("show", width=140)
+        self.tree.column("title", width=440)
         self.tree.pack(fill="both", expand=True, padx=14, pady=(0, 7))
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-1>", lambda e: self._open_subtitles())
@@ -776,17 +776,13 @@ class HomeTab:
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         self._node_paths.clear()
-        episodes = scan_episodes()
+        episodes = scan_episodes()  # 已经按 节目名→期数标题 排好序
 
-        shows = {}
+        shows = set()
         for show_name, ep_title, ep_path in episodes:
-            shows.setdefault(show_name, []).append((ep_title, ep_path))
-
-        for show_name, eps in shows.items():
-            show_node = self.tree.insert("", "end", text=show_name, values=(f"{len(eps)} 期",), open=True)
-            for ep_title, ep_path in eps:
-                node = self.tree.insert(show_node, "end", text=ep_title, values=("",))
-                self._node_paths[node] = ep_path
+            shows.add(show_name)
+            node = self.tree.insert("", "end", values=(show_name, ep_title))
+            self._node_paths[node] = ep_path
 
         if not episodes:
             self.status_label.config(text="还没有生成任何一期——跑一次 daily_podcast.py 之后回来刷新看看")
