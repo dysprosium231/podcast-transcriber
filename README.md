@@ -36,9 +36,15 @@
    copy config.example.json config.json
    ```
 
-   编辑 `config.json`（见下方「配置说明」）。
+   编辑 `config.json`（见下方「配置说明」），或者用图形化向导代替手动改 JSON + 设环境变量：
 
-4. 设置翻译服务的 API Key 环境变量（默认是 `DEEPSEEK_API_KEY`，具体看你 `config.json` 里的 `translation.api_key_env`）：
+   ```bat
+   python setup_wizard.py
+   ```
+
+   向导里可以添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义）、填 API Key、选 Whisper 模型大小并直接点按钮下载，保存后自动生成 `config.json` 并把 API Key 写入 Windows 环境变量。
+
+4. 如果没用上面的向导，手动设置翻译服务的 API Key 环境变量（默认是 `DEEPSEEK_API_KEY`，具体看你 `config.json` 里的 `translation.api_key_env`）：
 
    ```bat
    setx DEEPSEEK_API_KEY "你的key"
