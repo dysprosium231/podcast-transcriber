@@ -42,7 +42,24 @@
    python setup_wizard.py
    ```
 
+   或者不装 Python 也能用：去 [Releases](../../releases) 页面下载打包好的 `podcast-setup-wizard.exe`，双击直接打开（这个 exe 只是配置向导，真正跑转录/翻译的 `daily_podcast.py` 还是需要上面装好的 Python 环境）。
+
    向导里可以添加播客订阅、选翻译服务商预设（DeepSeek/OpenAI/Moonshot/自定义）、填 API Key、选 Whisper 模型大小并直接点按钮下载，还能直接设置/更新每日自动运行的时间点（自动帮你建好 Windows 计划任务，不用再去任务计划程序里手动配置），保存后自动生成 `config.json` 并把 API Key 写入 Windows 环境变量。
+
+   自己重新打包 exe：`pip install pyinstaller` 之后跑
+
+   ```bat
+   pyinstaller --onefile --windowed --name podcast-setup-wizard setup_wizard.py ^
+     --add-binary "<conda环境>\Library\bin\tcl86t.dll;." ^
+     --add-binary "<conda环境>\Library\bin\tk86t.dll;." ^
+     --add-binary "<conda环境>\Library\bin\liblzma.dll;." ^
+     --add-binary "<conda环境>\Library\bin\libbz2.dll;." ^
+     --add-binary "<conda环境>\Library\bin\ffi.dll;." ^
+     --add-binary "<conda环境>\Library\bin\libexpat.dll;." ^
+     --add-binary "<conda环境>\Library\bin\sqlite3.dll;."
+   ```
+
+   这几个 `--add-binary` 是因为 conda 环境的 tcl/tk 等运行时 DLL 不在 PyInstaller 默认能找到的位置，不加的话打包出来的 exe 在没装 conda 的机器上会因为缺 DLL 打不开。
 
 4. 如果没用上面的向导，手动设置翻译服务的 API Key 环境变量（默认是 `DEEPSEEK_API_KEY`，具体看你 `config.json` 里的 `translation.api_key_env`）：
 
