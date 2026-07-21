@@ -183,6 +183,35 @@ def apply_modern_style(root):
     )
 
 
+def make_scrollable(container):
+    """把container包一层Canvas+Scrollbar纵向滚动区域，返回内层Frame——调用方把原本要往
+    container里塞的内容改成塞进这个返回值就行，逻辑不用大改。
+
+    三个页签（播客库/手动处理下的三个子页签/设置）内容加起来都可能比主窗口高——主窗口是
+    resizable(False, False)的固定大小，缩小到能在常见笔记本分辨率下放得下之后，任何一个
+    页签内容稍微多一点（比如播客库的期数列表、手动处理里的三个子表单）就会被裁掉一截，
+    连按钮都点不到。每个页签都套一层，而不是只套内容最多的「设置」那一个。"""
+    canvas = tk.Canvas(container, bg=COLORS["bg"], highlightthickness=0)
+    scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    inner = ttk.Frame(canvas)
+    inner_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(inner_window, width=e.width))
+
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+    canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+    return inner
+
+
 def style_text_widget(widget):
     """tk.Text不是ttk控件，不吃ttk.Style，得手动设颜色"""
     widget.configure(
@@ -358,37 +387,8 @@ class SetupWizard:
     """
 
     def __init__(self, container):
-        # 这一页内容叠起来（订阅列表+翻译+模型+运行环境+计划任务+按钮）比其它两个页签高得多，
-        # 在分辨率矮一点或者DPI缩放大一点的屏幕上会超出主窗口固定的高度（App.__init__里
-        # resizable(False, False)，不能拖大也不会自动换算），底部的「保存配置」按钮会被
-        # 挤到屏幕外面，鼠标点不到——套一层Canvas+Scrollbar滚动区域，所有_build_*方法
-        # 照旧把内容放进self.parent，只是self.parent现在指向Canvas里的内层Frame，
-        # 而不是Notebook那个tab本身
         self.download_state = DownloadState()
-
-        canvas = tk.Canvas(container, bg=COLORS["bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        self.parent = ttk.Frame(canvas)
-        inner_window = canvas.create_window((0, 0), window=self.parent, anchor="nw")
-
-        def _sync_scrollregion(_event=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _sync_inner_width(event):
-            canvas.itemconfig(inner_window, width=event.width)
-
-        self.parent.bind("<Configure>", _sync_scrollregion)
-        canvas.bind("<Configure>", _sync_inner_width)
-
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        self.parent = make_scrollable(container)
 
         self._build_feeds_section()
         self._build_translation_section()
@@ -819,15 +819,18 @@ class HomeTab:
     """播客库主页——浏览 episodes/ 下已经生成的节目，双击/点按钮直接打开字幕页、音频或所在文件夹，
     不用自己去文件资源管理器里一层层找"""
 
-    def __init__(self, parent):
-        self.parent = parent
+    def __init__(self, container):
+        self.parent = make_scrollable(container)
+        parent = self.parent
 
         top = ttk.Frame(parent)
         top.pack(fill="x", padx=14, pady=(14, 7))
         ttk.Label(top, text="episodes/ 下已生成的节目", style="Heading.TLabel").pack(side="left")
         ttk.Button(top, text="刷新", command=self.refresh).pack(side="right")
 
-        self.tree = ttk.Treeview(parent, columns=("show", "title"), show="headings", height=22)
+        # height=12（原来是22）：这个页签现在也套了外层滚动区域，Treeview不用靠自己撑满
+        # 所有行才能看全，超过12行外层滚动条就能接着看，不用把整个页签撑得比窗口还高
+        self.tree = ttk.Treeview(parent, columns=("show", "title"), show="headings", height=12)
         self.tree.heading("show", text="节目")
         self.tree.heading("title", text="期数标题")
         self.tree.column("show", width=140)
@@ -1639,9 +1642,11 @@ class ManualProcessingTab:
         inner.add(rss_frame, text="RSS历史下载")
         inner.add(batch_frame, text="批量本地导入")
 
-        self.single = SingleFilePane(single_frame)
-        self.rss = RssHistoryPane(rss_frame)
-        self.batch = LocalBatchPane(batch_frame)
+        # 三个子页签各自套一层滚动区域——批量场景（RSS历史/批量导入）勾了很多期数时，
+        # 排队状态列表加上表单本身很容易比窗口还高
+        self.single = SingleFilePane(make_scrollable(single_frame))
+        self.rss = RssHistoryPane(make_scrollable(rss_frame))
+        self.batch = LocalBatchPane(make_scrollable(batch_frame))
 
     def refresh_show_choices(self):
         self.single.refresh_show_choices()
@@ -1658,7 +1663,11 @@ class App:
         apply_modern_style(root)  # 顺带设置好了DPI缩放
         root.title("播客自动化")
         scale = root.winfo_fpixels("1i") / 96.0
-        root.geometry(f"{int(800 * scale)}x{int(1040 * scale)}")
+        # 原来是1040，在1080p以下、或者DPI缩放大一点的屏幕上比可用工作区还高（实测过
+        # 1076px内容 vs 1019px工作区，「保存配置」按钮直接被挤到屏幕外点不到）。
+        # 现在每个页签都套了滚动区域（见make_scrollable），窗口本身不需要这么高了，
+        # 缩小到700，内容超出的部分靠各页签自己的滚动条查看
+        root.geometry(f"{int(800 * scale)}x{int(700 * scale)}")
         root.resizable(False, False)
 
         self.notebook = ttk.Notebook(root)
