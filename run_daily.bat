@@ -10,6 +10,13 @@ set PATH=%CONDA_ENV%;%CONDA_ENV%\Library\mingw-w64\bin;%CONDA_ENV%\Library\usr\b
 
 cd /d %~dp0
 
+:: logs\ is gitignored (it's per-machine runtime output, not something that belongs in
+:: version control), so a fresh clone doesn't have it. Without this, the very first
+:: redirect below fails silently -- cmd.exe can't open a log file in a directory that
+:: doesn't exist, so the whole line never runs, no notification ever shows, and there's
+:: no visible error anywhere. This bit a genuinely fresh install end to end.
+if not exist logs mkdir logs
+
 "%CONDA_ENV%\python.exe" prompt_before_run.py >> logs\prompt_debug.log 2>&1
 set PROMPT_EXIT=%errorlevel%
 echo EXITCODE_WAS_%PROMPT_EXIT% >> logs\prompt_debug.log
