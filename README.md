@@ -45,11 +45,15 @@
 
 > **为什么推荐 conda 而不是纯 pip venv**：CUDA 运行库在 Windows 上不好装——完整装 NVIDIA CUDA Toolkit 版本要跟 ctranslate2（faster-whisper 的推理引擎）编译时用的版本精确匹配，很容易踩坑；conda-forge 把这些库打成了普通 conda 包，装起来跟装其他 Python 包没区别，版本也管理得比较省心。如果你不想用 conda，也可以试试 pip 装 `nvidia-cublas-cu12`、`nvidia-cudnn-cu12` 这类官方 CUDA 轮子，但没有像 conda 这条路验证得那么充分。
 
-> **遇到 `cublas64_12.dll` / `cudnn64_9.dll` 之类"找不到 xxx.dll"的报错**：说明 CUDA 运行库没装好或者版本不匹配，回到第2步重新确认。可以用下面这行快速自检（在装好依赖的环境里跑，不报错就说明能找到）：
+> **遇到 `cublas64_12.dll` / `cudnn64_9.dll` 之类"找不到 xxx.dll"的报错**：最常见的原因不是没装好，而是**运行时没有激活这个 conda 环境**（比如直接双击/用绝对路径调用 `python.exe`，跳过了 `conda activate`）——conda 环境的 `Library\bin`（DLL 所在目录）要靠激活脚本加进 PATH，不激活就找不到。确认每次运行前都执行过 `conda activate whisper-env`（或者用 `run_daily.bat`/图形界面这些已经处理好这一步的入口）。
+>
+> 排查时注意：下面这行自检**只能证明 DLL 文件本身能被找到，不能完全排除问题**——它在没激活环境时也可能通过，因为 ctranslate2 真正调用 cublas 是在实际转录那一刻（懒加载），比这行自检更晚：
 >
 > ```bat
 > python -c "import ctypes; ctypes.WinDLL('cublas64_12.dll'); print('OK')"
 > ```
+>
+> 真要确认整条链路没问题，最好还是直接跑一次 `python daily_podcast.py`（在激活好的环境里）或者用「手动处理」实际转录一段音频。如果自检能过但转录时仍然报这个错，几乎可以确定就是没激活环境。
 
 ### 第3步：打开图形界面
 
