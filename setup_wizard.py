@@ -1738,8 +1738,9 @@ class SingleFilePane:
         url_entry.pack(side="left", padx=(6, 0))
         # 粘贴完链接、焦点移开的时候顺手去问一下视频标题，能省掉用户自己打一遍期数标题；
         # 拿不到（链接错、被拦了）就静默放弃，不当错误处理——反正开始转录前还会正常校验
-        # 期数标题是否为空，拿不到标题的话用户自己填就行
-        url_entry.bind("<FocusOut>", lambda e: self._fetch_video_title_async())
+        # 期数标题是否为空，拿不到标题的话用户自己填就行。节目名同理按来源站点给个默认值，
+        # 不用等网络请求，直接从链接本身就能判断，跟标题抓取绑在同一个事件上一起做
+        url_entry.bind("<FocusOut>", self._on_video_url_focus_out)
 
         form = ttk.Frame(parent)
         form.pack(fill="x", padx=10, pady=(0, 8))
@@ -1789,6 +1790,22 @@ class SingleFilePane:
         if not self.title_var.get().strip():
             self.title_var.set(os.path.splitext(os.path.basename(path))[0])
 
+    @staticmethod
+    def _default_show_name_for_url(url):
+        """单个视频链接本来就没有"节目"这个概念——不像播客RSS一个订阅源对应固定的一档节目，
+        按来源站点给个默认分类，不强制用户瞎起一个名字"""
+        if "bilibili.com" in url or "b23.tv" in url:
+            return "bilibili"
+        if "youtube.com" in url or "youtu.be" in url:
+            return "YouTube"
+        return "视频链接"
+
+    def _on_video_url_focus_out(self, _event=None):
+        url = self.video_url_var.get().strip()
+        if url and not self.show_var.get().strip():
+            self.show_var.set(self._default_show_name_for_url(url))
+        self._fetch_video_title_async()
+
     def _fetch_video_title_async(self):
         url = self.video_url_var.get().strip()
         if not url or self.title_var.get().strip():
@@ -1821,6 +1838,8 @@ class SingleFilePane:
             messagebox.showerror("错误", "请先选择音频文件，或者粘贴一个视频链接")
             return
         show_name = self.show_var.get().strip()
+        if not show_name and source_type == "ytdlp":
+            show_name = self._default_show_name_for_url(video_url)
         title = self.title_var.get().strip()
         if not show_name or not title:
             messagebox.showerror("错误", "节目名和期数标题都要填")
