@@ -49,6 +49,13 @@ DAILY_PODCAST_PATH = os.path.join(SCRIPT_DIR, "daily_podcast.py")
 TASK_NAME_DEFAULT = "DailyPodcast"
 EPISODES_DIR = os.path.join(SCRIPT_DIR, "episodes")
 
+SENSEVOICE_REPO = "lovemefan/SenseVoice-onnx"
+SENSEVOICE_MODEL_DIR = os.path.join(MODELS_DIR, "sensevoice")
+SENSEVOICE_MODEL_FILES = [
+    "embedding.npy", "sense-voice-encoder-int8.onnx", "chn_jpn_yue_eng_ko_spectok.bpe.model",
+    "fsmnvad-offline.onnx", "am.mvn", "fsmn-am.mvn", "fsmn-config.yaml",
+]
+
 RSS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -61,6 +68,14 @@ WHISPER_MODEL_CHOICES = [
 # 只支持中英两种语言+自动识别；配置文件里存value（"auto"/"en"/"zh"），下拉框显示label
 LANGUAGE_LABELS = {"auto": "自动识别（推荐）", "en": "英文", "zh": "中文"}
 LANGUAGE_VALUES_BY_LABEL = {v: k for k, v in LANGUAGE_LABELS.items()}
+
+# 转录引擎：whisper（GPU，英文/口音更稳）或sensevoice（纯CPU，不需要GPU/CUDA，中文更快更准还
+# 自带标点，但英文鲁棒性不如whisper）。配置文件里存value，下拉框显示label
+ENGINE_LABELS = {
+    "whisper": "Whisper（需要GPU，英文/口音更稳）",
+    "sensevoice": "SenseVoice（不需要GPU，中文更快更准）",
+}
+ENGINE_VALUES_BY_LABEL = {v: k for k, v in ENGINE_LABELS.items()}
 
 TRANSLATION_PRESETS = {
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "api_key_env": "DEEPSEEK_API_KEY"},
@@ -343,6 +358,59 @@ def model_is_downloaded(size):
     return os.path.isdir(d) and os.path.exists(os.path.join(d, "model.bin"))
 
 
+def sensevoice_model_is_downloaded():
+    return all(os.path.exists(os.path.join(SENSEVOICE_MODEL_DIR, f)) for f in SENSEVOICE_MODEL_FILES)
+
+
+def start_sensevoice_download(state):
+    """跟start_model_download()是并列的两条下载逻辑，SenseVoice这边全程纯CPU/ONNX，
+    不涉及CUDA，模型也小得多（int8量化版约240MB，whisper large-v3有好几个GB）"""
+    state.running = True
+    state.progress = 0.0
+    state.desc = "准备下载..."
+    state.done = False
+    state.error = None
+
+    def worker():
+        try:
+            from huggingface_hub import snapshot_download
+
+            outer_state = state
+
+            class ProgressTqdm(tqdm):
+                def update(self, n=1):
+                    super().update(n)
+                    if self.total:
+                        outer_state.progress = self.n / self.total
+                    outer_state.desc = self.desc or "下载中"
+
+            # 实测HF镜像偶尔会在几个KB大小的小文件上抽风（HEAD请求404几次），大文件反而没事，
+            # 按文件校验+重试几次基本都能过，不能假设snapshot_download一次就齐活
+            os.makedirs(SENSEVOICE_MODEL_DIR, exist_ok=True)
+            missing = SENSEVOICE_MODEL_FILES
+            for _attempt in range(4):
+                snapshot_download(
+                    repo_id=SENSEVOICE_REPO,
+                    local_dir=SENSEVOICE_MODEL_DIR,
+                    allow_patterns=missing,
+                    tqdm_class=ProgressTqdm,
+                )
+                missing = [f for f in SENSEVOICE_MODEL_FILES
+                           if not os.path.exists(os.path.join(SENSEVOICE_MODEL_DIR, f))]
+                if not missing:
+                    break
+            else:
+                raise RuntimeError(f"以下模型文件始终下载不全，请稍后重试：{missing}")
+            state.progress = 1.0
+            state.done = True
+        except Exception as e:
+            state.error = str(e)
+        finally:
+            state.running = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 class DownloadState:
     """下载线程和GUI主线程之间只通过这几个简单字段传递状态（不直接跨线程碰tk控件）"""
 
@@ -402,11 +470,14 @@ class SetupWizard:
 
     def __init__(self, container):
         self.download_state = DownloadState()
+        self.sensevoice_download_state = DownloadState()
         self.parent = make_scrollable(container)
 
         self._build_feeds_section()
         self._build_translation_section()
+        self._build_engine_section()
         self._build_model_section()
+        self._build_sensevoice_section()
         self._build_runtime_section()
         self._build_schedule_section()
         self._build_bottom_buttons()
@@ -421,6 +492,8 @@ class SetupWizard:
         self._populate_translation(config.get("translation", {}))
         self.model_size_var.set(config.get("whisper_model_size", "large-v3"))
         self._refresh_model_status()
+        self._refresh_sensevoice_status()
+        self.engine_var.set(ENGINE_LABELS.get(config.get("transcribe_engine", "whisper"), ENGINE_LABELS["whisper"]))
         self.language_var.set(LANGUAGE_LABELS.get(config.get("language", "auto"), LANGUAGE_LABELS["auto"]))
         self.python_exe_var.set(config.get("python_exe", ""))
         self._refresh_schedule_from_task()
@@ -542,6 +615,38 @@ class SetupWizard:
         self.api_key_entry.config(show="" if self.show_key_var.get() else "*")
 
     # ---------------- Whisper模型 ----------------
+    def _build_engine_section(self):
+        frame = ttk.LabelFrame(self.parent, text="转录引擎与语言")
+        frame.pack(fill="x", padx=14, pady=7)
+
+        engine_row = ttk.Frame(frame)
+        engine_row.pack(fill="x", padx=10, pady=10)
+        ttk.Label(engine_row, text="转录引擎").pack(side="left")
+        self.engine_var = tk.StringVar(value=ENGINE_LABELS["whisper"])
+        ttk.Combobox(
+            engine_row, textvariable=self.engine_var,
+            values=list(ENGINE_LABELS.values()), state="readonly", width=28,
+        ).pack(side="left", padx=(4, 10))
+
+        lang_row = ttk.Frame(frame)
+        lang_row.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(lang_row, text="转录语言").pack(side="left")
+        self.language_var = tk.StringVar(value=LANGUAGE_LABELS["auto"])
+        ttk.Combobox(
+            lang_row, textvariable=self.language_var,
+            values=list(LANGUAGE_LABELS.values()), state="readonly", width=16,
+        ).pack(side="left", padx=(4, 10))
+
+        ttk.Label(
+            frame, style="Muted.TLabel", wraplength=680, justify="left",
+            text="Whisper效果更成熟，尤其擅长处理口音较重的英文，但要跑GPU（需要CUDA环境）。"
+                 "SenseVoice全程CPU/ONNX Runtime，不需要GPU、不需要装CUDA，中文识别更快更准还"
+                 "自带标点，但英文鲁棒性不如Whisper——没有GPU、或者主要转录中文内容的话优先"
+                 "选SenseVoice；转录以英文为主、追求最佳准确率就用Whisper。\n"
+                 "只支持中文/英文两种语言。自动识别是转录时顺带判断的，不额外花时间；"
+                 "源音频语言比较确定的话手动指定能避免偶尔识别错。识别为中文时会自动跳过翻译这一步。",
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
     def _build_model_section(self):
         frame = ttk.LabelFrame(self.parent, text="Whisper 转录模型")
         frame.pack(fill="x", padx=14, pady=7)
@@ -568,19 +673,53 @@ class SetupWizard:
         self.download_status_label = ttk.Label(frame, text="", style="Muted.TLabel")
         self.download_status_label.pack(anchor="w", padx=10, pady=(0, 10))
 
-        lang_row = ttk.Frame(frame)
-        lang_row.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Label(lang_row, text="转录语言").pack(side="left")
-        self.language_var = tk.StringVar(value=LANGUAGE_LABELS["auto"])
-        ttk.Combobox(
-            lang_row, textvariable=self.language_var,
-            values=list(LANGUAGE_LABELS.values()), state="readonly", width=16,
-        ).pack(side="left", padx=(4, 10))
-        ttk.Label(
-            frame, style="Muted.TLabel", wraplength=680, justify="left",
-            text="只支持中文/英文。自动识别是whisper转录时顺带判断的，不用额外花时间；"
-                 "如果源音频语言比较确定，手动指定能避免偶尔识别错。识别为中文时会自动跳过翻译这一步。",
-        ).pack(anchor="w", padx=10, pady=(0, 10))
+    def _build_sensevoice_section(self):
+        frame = ttk.LabelFrame(self.parent, text="SenseVoice 转录模型（纯CPU，不需要GPU/CUDA）")
+        frame.pack(fill="x", padx=14, pady=7)
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x", padx=10, pady=10)
+        ttk.Label(row, text="模型：SenseVoiceSmall（int8量化版，约240MB）").pack(side="left")
+
+        self.sensevoice_status_label = ttk.Label(row, text="")
+        self.sensevoice_status_label.pack(side="left", padx=(10, 10))
+
+        self.sensevoice_download_btn = ttk.Button(row, text="下载此模型", command=self._start_sensevoice_download)
+        self.sensevoice_download_btn.pack(side="left")
+
+        self.sensevoice_download_progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.sensevoice_download_progress.pack(fill="x", padx=10, pady=(0, 5))
+        self.sensevoice_download_status_label = ttk.Label(frame, text="", style="Muted.TLabel")
+        self.sensevoice_download_status_label.pack(anchor="w", padx=10, pady=(0, 10))
+
+    def _refresh_sensevoice_status(self):
+        if sensevoice_model_is_downloaded():
+            self.sensevoice_status_label.config(text="✅ 本地已有", style="Success.TLabel")
+            self.sensevoice_download_btn.config(state="disabled")
+        else:
+            self.sensevoice_status_label.config(text="⬇ 本地未下载", style="Warning.TLabel")
+            self.sensevoice_download_btn.config(state="normal")
+
+    def _start_sensevoice_download(self):
+        self.sensevoice_download_btn.config(state="disabled")
+        self.sensevoice_download_status_label.config(text="正在下载（约240MB）...", style="Muted.TLabel")
+        start_sensevoice_download(self.sensevoice_download_state)
+        self._poll_sensevoice_download()
+
+    def _poll_sensevoice_download(self):
+        state = self.sensevoice_download_state
+        self.sensevoice_download_progress["value"] = state.progress * 100
+        if state.error:
+            self.sensevoice_download_status_label.config(text=f"下载失败：{state.error}", style="Danger.TLabel")
+            self.sensevoice_download_btn.config(state="normal")
+            return
+        if state.done:
+            self.sensevoice_download_status_label.config(text="下载完成", style="Success.TLabel")
+            self._refresh_sensevoice_status()
+            return
+        if state.running:
+            self.sensevoice_download_status_label.config(text=f"下载中... {state.desc}", style="Muted.TLabel")
+            self.parent.after(200, self._poll_sensevoice_download)
 
     def _refresh_model_status(self):
         size = self.model_size_var.get()
@@ -788,6 +927,7 @@ class SetupWizard:
         return {
             "feeds": feeds,
             "whisper_model_size": self.model_size_var.get(),
+            "transcribe_engine": ENGINE_VALUES_BY_LABEL.get(self.engine_var.get(), "whisper"),
             "language": LANGUAGE_VALUES_BY_LABEL.get(self.language_var.get(), "auto"),
             "python_exe": self.python_exe_var.get().strip(),
             "translation": {
@@ -1232,12 +1372,14 @@ def _process_one_job(python_exe, job, on_stage):
 
     # config.json里存的就是"auto"/"en"/"zh"这个原始value（下拉框label<->value的转换在
     # SettingsTab保存时就做完了），这里直接读，不用再转一次
-    language = load_existing_config().get("language", "auto")
+    config = load_existing_config()
+    language = config.get("language", "auto")
+    engine = config.get("transcribe_engine", "whisper")
     args = [
         python_exe, DAILY_PODCAST_PATH, "--manual-job",
         "--show", job.show_name, "--title", job.episode_title,
         "--source-type", job.source_type, "--source", source_arg,
-        "--published", job.published, "--language", language,
+        "--published", job.published, "--language", language, "--engine", engine,
     ]
     env = build_subprocess_env(python_exe)
     proc = subprocess.Popen(

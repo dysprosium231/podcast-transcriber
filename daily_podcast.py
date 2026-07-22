@@ -69,6 +69,18 @@ LATEST_LOG = "latest_episodes.txt"
 
 LANGUAGE = CONFIG.get("language", "auto")  # "auto"/"en"/"zh"，只支持这两种语言+自动识别
 
+# 转录引擎："whisper"（默认，GPU跑，英文/口音更稳）或"sensevoice"（纯CPU，不需要GPU/CUDA，
+# 中文更快更准还自带标点，但英文鲁棒性不如whisper，见README里的对比说明）
+TRANSCRIBE_ENGINE = CONFIG.get("transcribe_engine", "whisper")
+
+SENSEVOICE_REPO = "lovemefan/SenseVoice-onnx"
+SENSEVOICE_MODEL_DIR = os.path.join(SCRIPT_DIR, "models", "sensevoice")
+SENSEVOICE_MODEL_FILES = [
+    "embedding.npy", "sense-voice-encoder-int8.onnx", "chn_jpn_yue_eng_ko_spectok.bpe.model",
+    "fsmnvad-offline.onnx", "am.mvn", "fsmn-am.mvn", "fsmn-config.yaml",
+]
+# int8量化版本（约240MB），纯CPU跑起来也够快，没必要为了一点精度差异去下载937MB的fp32版本
+
 TRANSLATION_CONFIG = CONFIG.get("translation", {})
 TRANSLATION_PROVIDER_NAME = TRANSLATION_CONFIG.get("provider_name", "翻译服务")
 TRANSLATION_MODEL = TRANSLATION_CONFIG.get("model")
@@ -862,6 +874,149 @@ def _load_model():
     return model, batched_model
 
 
+def load_engine_model(engine):
+    """按引擎名加载对应的模型会话（whisper走GPU，sensevoice走纯CPU/ONNX，互不依赖）"""
+    if engine == "sensevoice":
+        return _load_sensevoice_model()
+    return _load_model()
+
+
+def run_transcribe(engine, session, audio_path, language="auto", on_progress=None):
+    """按引擎名分发到对应的转录函数，接口统一返回(segments, detected_lang)"""
+    if engine == "sensevoice":
+        return transcribe_audio_sensevoice(session, audio_path, language=language, on_progress=on_progress)
+    _model, batched_model = session
+    return transcribe_audio(batched_model, audio_path, language=language, on_progress=on_progress)
+
+
+def sensevoice_model_ready():
+    return all(os.path.exists(os.path.join(SENSEVOICE_MODEL_DIR, f)) for f in SENSEVOICE_MODEL_FILES)
+
+
+def download_sensevoice_model(tqdm_class=None):
+    """下载SenseVoice的ONNX模型文件（一次性，之后离线可用）。全程纯CPU/ONNX Runtime，
+    不涉及CUDA，跟whisper的GPU模型下载是完全独立的两套东西。
+    实测HF镜像偶尔会在几个KB大小的小文件上抽风（HEAD请求404几次），大文件反而没事，
+    重试几次基本都能过，所以这里按文件校验+重试，而不是假设snapshot_download一次就齐活"""
+    from huggingface_hub import snapshot_download
+
+    os.makedirs(SENSEVOICE_MODEL_DIR, exist_ok=True)
+    missing = SENSEVOICE_MODEL_FILES
+    last_error = None
+    for attempt in range(4):
+        try:
+            snapshot_download(
+                repo_id=SENSEVOICE_REPO,
+                local_dir=SENSEVOICE_MODEL_DIR,
+                allow_patterns=missing,
+                tqdm_class=tqdm_class,
+            )
+        except Exception as e:
+            last_error = e
+        missing = [f for f in SENSEVOICE_MODEL_FILES
+                   if not os.path.exists(os.path.join(SENSEVOICE_MODEL_DIR, f))]
+        if not missing:
+            return
+    raise RuntimeError(f"以下模型文件始终下载不全，请稍后重试：{missing}") from last_error
+
+
+_SENSEVOICE_LANG_CODES = {"auto": 0, "zh": 3, "en": 4}
+# 输出文本开头会带一串特殊token，比如"<|zh|><|NEUTRAL|><|Speech|><|withitn|>"，分别是语言/情绪/
+# 声音事件/是否做了ITN——语言标签内容是固定的语言代码小写，情绪/事件标签是大写单词，
+# 必须大小写不敏感匹配+匹配任意内容，不能只认小写字母，不然"<|NEUTRAL|>"这种漏刷不掉
+_SENSEVOICE_ANY_TAG_RE = re.compile(r"<\|[^|]+\|>")
+_SENSEVOICE_LANG_TAG_RE = re.compile(r"<\|(zh|en|yue|ja|ko|nospeech)\|>", re.IGNORECASE)
+
+
+def _load_sensevoice_model():
+    """加载SenseVoice的ONNX会话（编码器+VAD+分词器），返回(front, model, vad)供transcribe_audio_sensevoice复用。
+    跑在后台线程（配合spinner.run_with_work），跟_load_model()是并列的两条加载路径。"""
+    from sensevoice.onnx.sense_voice_ort_session import SenseVoiceInferenceSession
+    from sensevoice.utils.frontend import WavFrontend
+    from sensevoice.utils.fsmn_vad import FSMNVad
+
+    # 必须传绝对路径：这个第三方包内部拼VAD模型路径时有个重复拼接的bug（拿root_dir又和一个
+    # 已经带了root_dir前缀的相对路径再拼一次），传绝对路径能让pathlib的"绝对路径覆盖前缀"
+    # 行为正好绕开这个bug，不用去改site-packages里的代码
+    front = WavFrontend(os.path.join(SENSEVOICE_MODEL_DIR, "am.mvn"))
+    model = SenseVoiceInferenceSession(
+        os.path.join(SENSEVOICE_MODEL_DIR, "embedding.npy"),
+        os.path.join(SENSEVOICE_MODEL_DIR, "sense-voice-encoder-int8.onnx"),
+        os.path.join(SENSEVOICE_MODEL_DIR, "chn_jpn_yue_eng_ko_spectok.bpe.model"),
+        -1, 4,  # device=-1（CPU），4个推理线程
+    )
+    vad = FSMNVad(SENSEVOICE_MODEL_DIR)
+    return front, model, vad
+
+
+def _decode_to_16k_wav(audio_path, wav_path):
+    """用PyAV把任意格式的音频解码+重采样成16kHz单声道，写成wav文件——SenseVoice的VAD
+    (FSMNVad.segments_offline)直接读文件本身，且写死只认16kHz，不像whisper那边ctranslate2
+    内部自己处理任意采样率/格式，这里得手动转好了再喂给它"""
+    import av
+
+    container = av.open(audio_path)
+    out = av.open(wav_path, "w")
+    out_stream = out.add_stream("pcm_s16le", rate=16000)
+    out_stream.layout = "mono"
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+    for frame in container.decode(audio=0):
+        for rframe in resampler.resample(frame):
+            for packet in out_stream.encode(rframe):
+                out.mux(packet)
+    for packet in out_stream.encode(None):
+        out.mux(packet)
+    container.close()
+    out.close()
+
+
+def transcribe_audio_sensevoice(sv_session, audio_path, language="auto", on_progress=None):
+    """跟transcribe_audio()接口对齐：返回(segments, detected_lang)。sv_session是
+    _load_sensevoice_model()返回的(front, model, vad)三元组。"""
+    import tempfile
+    import soundfile as sf
+
+    front, model, vad = sv_session
+
+    fd, tmp_wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        _decode_to_16k_wav(audio_path, tmp_wav_path)
+        waveform, _ = sf.read(tmp_wav_path, dtype="float32")
+        vad_segments = vad.segments_offline(tmp_wav_path)
+    finally:
+        os.remove(tmp_wav_path)
+
+    lang_code = _SENSEVOICE_LANG_CODES.get(language, 0)
+    result = []
+    total = len(vad_segments) or 1
+    detected_lang = None
+
+    for i, part in enumerate(vad_segments):
+        audio_feats = front.get_features(waveform[part[0] * 16:part[1] * 16])
+        raw_text = model(audio_feats[None, ...], language=lang_code, use_itn=True)
+
+        tag_match = _SENSEVOICE_LANG_TAG_RE.search(raw_text)
+        seg_lang = tag_match.group(1).lower() if tag_match else "en"
+        if seg_lang not in ("zh", "en"):
+            seg_lang = "en"  # 只支持中英，粤语/日语/韩语等一律归到en桶，跟whisper那边保持一致
+        if detected_lang is None:
+            detected_lang = seg_lang
+
+        text = _SENSEVOICE_ANY_TAG_RE.sub("", raw_text).strip()
+        result.append({
+            "start": part[0] / 1000,
+            "end": part[1] / 1000,
+            "en": "" if seg_lang == "zh" else text,
+            "zh": text if seg_lang == "zh" else "",
+        })
+
+        if on_progress:
+            on_progress((i + 1) / total)
+
+    return result, (detected_lang or "en")
+
+
 # ==================== 主流程 ====================
 def main():
     print(f"=== RUN START {datetime.now()} ===")
@@ -872,9 +1027,8 @@ def main():
     os.makedirs(EPISODES_DIR, exist_ok=True)
 
     # 模型懒加载：只有真正确认有新一期要转录时才加载（只加载一次，供后续节目复用），
-    # 这样"今天两个节目都没更新"的最常见情况就不用白等1-2分钟的GPU模型加载
-    model = None
-    batched_model = None
+    # 这样"今天两个节目都没更新"的最常见情况就不用白等模型加载的时间
+    session = None
     showed_click_to_open = False
 
     for show_name, rss_url in FEEDS.items():
@@ -884,14 +1038,18 @@ def main():
         if job is None:
             continue
 
-        if model is None:
+        if session is None:
             spinner = SpinnerProgress("播客自动化")
-            spinner.set_stage("正在加载GPU模型（首次可能需要1-2分钟）...")
+            spinner.set_stage(
+                "正在加载SenseVoice模型（CPU，首次可能需要几十秒）..."
+                if TRANSCRIBE_ENGINE == "sensevoice" else
+                "正在加载GPU模型（首次可能需要1-2分钟）..."
+            )
             try:
-                model, batched_model = spinner.run_with_work(_load_model)
+                session = spinner.run_with_work(lambda: load_engine_model(TRANSCRIBE_ENGINE))
             except Exception as e:
                 print(f"Model loading failed: {e}")
-                notify_simple("播客自动化启动失败", f"GPU模型加载失败: {e}"[:100])
+                notify_simple("播客自动化启动失败", f"模型加载失败: {e}"[:100])
                 return
 
         current_title = job["current_title"]
@@ -916,9 +1074,9 @@ def main():
                 on_progress=lambda p: progress.update(f"下载中 {int(p*100)}%", p * 0.2),
             )
 
-            progress.update("转录中（GPU运算）", 0.2)
-            segments, detected_lang = transcribe_audio(
-                batched_model, audio_path, language=LANGUAGE,
+            progress.update("转录中" + ("" if TRANSCRIBE_ENGINE == "sensevoice" else "（GPU运算）"), 0.2)
+            segments, detected_lang = run_transcribe(
+                TRANSCRIBE_ENGINE, session, audio_path, language=LANGUAGE,
                 on_progress=lambda p: progress.update(f"转录中 {int(p*100)}%", 0.2 + p * 0.6),
             )
 
@@ -943,6 +1101,7 @@ def main():
                     "published": job.get("published", ""),
                     "processed_at": datetime.now().isoformat(),
                     "language": detected_lang,
+                    "engine": TRANSCRIBE_ENGINE,
                 },
                 episode_dir,
             )
@@ -981,7 +1140,7 @@ def _emit_json(payload):
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-def run_manual_job(show_name, episode_title, source_type, source, published="", language="auto"):
+def run_manual_job(show_name, episode_title, source_type, source, published="", language="auto", engine="whisper"):
     """手动任务模式的核心逻辑：不检查RSS、不循环多个节目，只处理指定的这一个音频。
     被 setup_wizard.py 当独立子进程调用——这样GUI本身不需要打包faster-whisper/ctranslate2这些
     体积巨大的转录依赖，也不用操心CUDA运行库有没有被打包进exe，因为跑的就是真实python环境。
@@ -1032,11 +1191,9 @@ def run_manual_job(show_name, episode_title, source_type, source, published="", 
             on_progress=lambda p: _emit_json({"stage": f"下载中 {int(p * 100)}%", "progress": p * 0.2}),
         )
 
-    model = WhisperModel(MODEL_PATH, device="cuda", compute_type="float16")
-    batched_model = BatchedInferencePipeline(model=model)
-
-    segments, detected_lang = transcribe_audio(
-        batched_model, audio_dest, language=language,
+    session = load_engine_model(engine)
+    segments, detected_lang = run_transcribe(
+        engine, session, audio_dest, language=language,
         on_progress=lambda p: _emit_json({"stage": f"转录中 {int(p * 100)}%", "progress": 0.2 + p * 0.6}),
     )
     if detected_lang == "zh":
@@ -1058,7 +1215,12 @@ def run_manual_job(show_name, episode_title, source_type, source, published="", 
     generate_srt(segments, os.path.join(episode_dir, "subtitles.srt"))
     generate_vtt(segments, os.path.join(episode_dir, "subtitles.vtt"))
     save_episode_meta(
-        {"published": published, "processed_at": datetime.now().isoformat(), "language": detected_lang},
+        {
+            "published": published,
+            "processed_at": datetime.now().isoformat(),
+            "language": detected_lang,
+            "engine": engine,
+        },
         episode_dir,
     )
     _emit_json({"done": True, "result_dir": episode_dir})
@@ -1076,11 +1238,12 @@ if __name__ == "__main__":
         parser.add_argument("--source", required=True)
         parser.add_argument("--published", default="")
         parser.add_argument("--language", default="auto", choices=["auto", "en", "zh"])
+        parser.add_argument("--engine", default="whisper", choices=["whisper", "sensevoice"])
         cli_args = parser.parse_args()
         try:
             run_manual_job(
                 cli_args.show, cli_args.title, cli_args.source_type, cli_args.source,
-                published=cli_args.published, language=cli_args.language,
+                published=cli_args.published, language=cli_args.language, engine=cli_args.engine,
             )
         except Exception as e:
             _emit_json({"error": str(e)})
