@@ -1769,11 +1769,12 @@ class SingleFilePane:
         self.video_url_var = tk.StringVar()
         url_entry = ttk.Entry(url_row, textvariable=self.video_url_var, width=40)
         url_entry.pack(side="left", padx=(6, 0))
-        # 粘贴完链接、焦点移开的时候顺手去问一下视频标题，能省掉用户自己打一遍期数标题；
-        # 拿不到（链接错、被拦了）就静默放弃，不当错误处理——反正开始转录前还会正常校验
-        # 期数标题是否为空，拿不到标题的话用户自己填就行。节目名同理按来源站点给个默认值，
-        # 不用等网络请求，直接从链接本身就能判断，跟标题抓取绑在同一个事件上一起做
+        # 粘贴完链接之后（焦点移开，或者直接按回车）顺手去问一下视频标题，能省掉用户自己打
+        # 一遍期数标题；拿不到（链接错、被拦了）就静默放弃，不当错误处理——反正开始转录前
+        # 还会正常校验期数标题是否为空，拿不到标题的话用户自己填就行。节目名同理按来源站点
+        # 给个默认值，不用等网络请求，直接从链接本身就能判断，跟标题抓取绑在同一个事件上一起做
         url_entry.bind("<FocusOut>", self._on_video_url_focus_out)
+        url_entry.bind("<Return>", self._on_video_url_focus_out)
 
         form = ttk.Frame(parent)
         form.pack(fill="x", padx=10, pady=(0, 8))
@@ -1801,8 +1802,12 @@ class SingleFilePane:
             parent, style="Muted.TLabel", wraplength=680, justify="left",
             text=(
                 "节目名如果跟已有的一样，会归到同一个节目下面；不一样就会新建一个。\n"
+                "粘贴视频链接后按回车（或者点别处让输入框失去焦点），节目名/期数标题没填的话"
+                "会自动去查视频标题、按来源站点（bilibili/YouTube）填默认节目名，省得手动打；"
+                "查不到的话（链接错、被拦了）自己填就行。\n"
                 "视频链接支持yt-dlp能解析的网站（YouTube、B站等），只下音频不下视频。"
-                "YouTube这边经常会被识别成「机器人」拦掉，不稳定，B站相对稳一些。\n"
+                "YouTube这边经常会被识别成「机器人」拦掉，不稳定，B站相对稳一些——"
+                "「设置」页可以选一个浏览器带上已登录的cookies，能缓解这个问题（不保证100%有效）。\n"
                 "提示：如果是用打包好的独立exe运行，这个功能需要电脑上有CUDA运行环境才能跑GPU转录；"
                 "更省心的做法是用 python setup_wizard.py 在项目自带的conda环境里运行。"
             ),

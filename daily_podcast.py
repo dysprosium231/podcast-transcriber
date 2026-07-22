@@ -1014,12 +1014,15 @@ def _load_diarization_model():
     import sherpa_onnx
 
     config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        # 分割模型和embedding模型的num_threads各自默认是1（单线程！），实测一小时的播客
+        # 单线程跑要三四十分钟，比转录本身还慢；跟SenseVoice一样开4线程，实测能提速到几分钟内
         segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
             pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
                 model=DIARIZATION_SEGMENTATION_FILE
             ),
+            num_threads=4,
         ),
-        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=DIARIZATION_EMBEDDING_FILE),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=DIARIZATION_EMBEDDING_FILE, num_threads=4),
         clustering=sherpa_onnx.FastClusteringConfig(num_clusters=DIARIZATION_NUM_SPEAKERS, threshold=0.5),
         min_duration_on=0.3,
         min_duration_off=0.5,
