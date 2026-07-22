@@ -1067,17 +1067,31 @@ def diarize_audio(sd, audio_path, on_progress=None):
 
 
 def assign_speakers(segments, diar_result):
-    """给每句转录segment按时间重叠度贴一个说话人标签，不改动segment原有的start/end时间戳。
-    重叠度最高的说话人胜出；完全没有重叠（比如VAD切分误差导致的缝隙）就留空，不强行瞎猜"""
+    """给每句转录segment按时间重叠度贴说话人标签，不改动segment原有的start/end时间戳。
+
+    diar_result里不同说话人的区间本来就允许互相重叠——分割模型是按帧多标签判断"这一刻有哪几个人
+    在说话"，真实的抢话/插话会体现成两个不同说话人的区间在时间上重叠，这不是识别错误，是模型真的
+    识别到了同时说话。之前的实现只取重叠时长最大的那一个（赢者通吃），重叠里另一个说话人的信息
+    虽然diar_result里明明有、却被直接丢掉了——这里改成把重叠占比超过阈值的说话人都保留下来，
+    多人重叠时标成"说话人1、说话人2"这样，不再假装只有一个人在说"""
+    OVERLAP_RATIO_THRESHOLD = 0.2  # 重叠时长占这句话自身时长的比例，低于这个当噪声/边界误差不计入
     for seg in segments:
-        best_overlap = 0.0
-        best_speaker = None
-        for d_start, d_end, speaker_id in diar_result:
-            overlap = min(seg["end"], d_end) - max(seg["start"], d_start)
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = speaker_id
-        seg["speaker"] = f"说话人{best_speaker + 1}" if best_speaker is not None else ""
+        seg_duration = seg["end"] - seg["start"]
+        overlaps = [
+            (speaker_id, min(seg["end"], d_end) - max(seg["start"], d_start))
+            for d_start, d_end, speaker_id in diar_result
+        ]
+        overlaps = [(spk, ov) for spk, ov in overlaps if ov > 0]
+        if not overlaps or seg_duration <= 0:
+            seg["speaker"] = ""
+            continue
+        overlaps.sort(key=lambda x: -x[1])
+        significant = {spk for spk, ov in overlaps if ov / seg_duration >= OVERLAP_RATIO_THRESHOLD}
+        if not significant:
+            significant = {overlaps[0][0]}  # 都没到阈值的话至少保留重叠最多的那个，不留空
+        seen = set()
+        ordered = [spk for spk, _ in overlaps if spk in significant and not (spk in seen or seen.add(spk))]
+        seg["speaker"] = "、".join(f"说话人{spk + 1}" for spk in ordered)
     return segments
 
 
