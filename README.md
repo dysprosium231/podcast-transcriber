@@ -169,7 +169,7 @@ python setup_wizard.py
   "language": "auto",                 // "auto"/"en"/"zh"，只支持这两种语言+自动识别
   "enable_diarization": false,        // 是否启用说话人区分
   "diarization_num_speakers": -1,     // 说话人数量，-1表示自动判断
-  "ytdlp_cookies_browser": "",         // 可选："chrome"/"edge"/"firefox"，下载YouTube/B站链接时
+  "ytdlp_cookies_browser": "",        // 可选："chrome"/"edge"/"firefox"，下载YouTube/B站链接时
                                       // 带上这个浏览器里已登录的cookies，缓解YouTube机器人拦截
   "python_exe": "",                  // 可选：手动处理/计划任务用来跑转录/翻译的真实python.exe路径，
                                       // 留空会自动探测；保存配置时也会同步写进 run_daily.bat
