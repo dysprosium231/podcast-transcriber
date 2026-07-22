@@ -8,6 +8,7 @@ import json
 import ctypes
 import shutil
 import zipfile
+import tarfile
 from datetime import datetime
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from openai import OpenAI
@@ -80,6 +81,22 @@ SENSEVOICE_MODEL_FILES = [
     "fsmnvad-offline.onnx", "am.mvn", "fsmn-am.mvn", "fsmn-config.yaml",
 ]
 # int8量化版本（约240MB），纯CPU跑起来也够快，没必要为了一点精度差异去下载937MB的fp32版本
+
+# 说话人分离（可选，默认关）：跟转录引擎（whisper/sensevoice）完全独立的第三套模型，纯CPU/ONNX，
+# 不需要HuggingFace账号/token（直接走GitHub Releases直链），底层是sherpa-onnx对pyannote分割模型
+# 的ONNX转换版 + 3D-Speaker声纹embedding模型
+ENABLE_DIARIZATION = CONFIG.get("enable_diarization", False)
+DIARIZATION_NUM_SPEAKERS = CONFIG.get("diarization_num_speakers", -1)  # -1表示自动判断说话人数
+
+DIARIZATION_MODEL_DIR = os.path.join(SCRIPT_DIR, "models", "diarization")
+DIARIZATION_SEGMENTATION_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+DIARIZATION_EMBEDDING_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+DIARIZATION_SEGMENTATION_FILE = os.path.join(
+    DIARIZATION_MODEL_DIR, "sherpa-onnx-pyannote-segmentation-3-0", "model.onnx"
+)
+DIARIZATION_EMBEDDING_FILE = os.path.join(
+    DIARIZATION_MODEL_DIR, "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+)
 
 TRANSLATION_CONFIG = CONFIG.get("translation", {})
 TRANSLATION_PROVIDER_NAME = TRANSLATION_CONFIG.get("provider_name", "翻译服务")
@@ -707,8 +724,11 @@ def _format_timestamp(seconds, decimal_mark):
 
 def _subtitle_cue_text(seg):
     """英文+中文各一行；某一行缺失（翻译失败，或源语言本来就是中文没有英文）就只留有内容的那行，
-    不留空行占位"""
-    return "\n".join(line for line in (seg["en"], seg["zh"]) if line)
+    不留空行占位。有说话人标签（开了说话人分离）就再加一行放在最前面"""
+    lines = [line for line in (seg["en"], seg["zh"]) if line]
+    if seg.get("speaker"):
+        lines = [f"[{seg['speaker']}]"] + lines
+    return "\n".join(lines)
 
 
 def generate_srt(segments, output_path):
@@ -754,6 +774,7 @@ def generate_html(title, audio_filename, segments, output_path):
   .line:hover { background: #eee; }
   .line.active { background: #fff3cd; }
   .time { color: #aaa; font-size: 12px; margin-right: 8px; font-variant-numeric: tabular-nums; }
+  .speaker { font-size: 12px; font-weight: 600; margin-right: 8px; }
   .en { color: #2b2b2b; font-size: 16px; line-height: 1.7; letter-spacing: 0.1px; }
   .zh { color: #666; font-size: 15px; line-height: 1.9; margin-top: 8px; letter-spacing: 0.3px; }
 </style>
@@ -776,6 +797,15 @@ function formatTime(s) {
   return `${m}:${sec}`;
 }
 
+// 说话人按名字哈希到固定的几个颜色上，同一个人从头到尾颜色一致；具体是哪几个说话人
+// 生成HTML的时候还不知道（取决于这一集实际识别出几个人），所以只能在前端动态分配
+const SPEAKER_COLORS = ["#4f8ef7", "#e8823f", "#3fae6a", "#a862d6", "#d64f8f", "#5aa8a8"];
+function speakerColor(name) {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  return SPEAKER_COLORS[hash % SPEAKER_COLORS.length];
+}
+
 segments.forEach((seg, i) => {
   const div = document.createElement("div");
   div.className = "line";
@@ -784,7 +814,9 @@ segments.forEach((seg, i) => {
   // 这时zh要顶替成主行，而不是照旧当小号灰字的翻译行
   const primary = seg.en || seg.zh;
   const secondary = (seg.en && seg.zh) ? seg.zh : "";
-  div.innerHTML = `<span class="time">${formatTime(seg.start)}</span>
+  const speakerHtml = seg.speaker
+    ? `<span class="speaker" style="color:${speakerColor(seg.speaker)}">${seg.speaker}</span>` : "";
+  div.innerHTML = `<span class="time">${formatTime(seg.start)}</span>${speakerHtml}
                     <div class="en">${primary}</div>
                     <div class="zh">${secondary}</div>`;
   div.onclick = () => { audio.currentTime = seg.start; audio.play(); };
@@ -896,8 +928,10 @@ def sensevoice_model_ready():
 def download_sensevoice_model(tqdm_class=None):
     """下载SenseVoice的ONNX模型文件（一次性，之后离线可用）。全程纯CPU/ONNX Runtime，
     不涉及CUDA，跟whisper的GPU模型下载是完全独立的两套东西。
-    实测HF镜像偶尔会在几个KB大小的小文件上抽风（HEAD请求404几次），大文件反而没事，
-    重试几次基本都能过，所以这里按文件校验+重试，而不是假设snapshot_download一次就齐活"""
+    实测HF镜像偶尔会在几个KB大小的小文件上一直卡在HEAD请求这一步（snapshot_download内部靠
+    HEAD判断文件是否存在/要不要重新下），同一个文件重试多少次都一样会卡；直接用requests对
+    resolve/main/<文件名>这个URL发GET请求反而每次都成功——绕开了HEAD这一步，所以retry几轮
+    snapshot_download还是缺文件的话，最后退化成直接GET每个缺失文件"""
     from huggingface_hub import snapshot_download
 
     os.makedirs(SENSEVOICE_MODEL_DIR, exist_ok=True)
@@ -917,7 +951,124 @@ def download_sensevoice_model(tqdm_class=None):
                    if not os.path.exists(os.path.join(SENSEVOICE_MODEL_DIR, f))]
         if not missing:
             return
-    raise RuntimeError(f"以下模型文件始终下载不全，请稍后重试：{missing}") from last_error
+    for filename in missing:
+        try:
+            url = f"{os.environ['HF_ENDPOINT']}/{SENSEVOICE_REPO}/resolve/main/{filename}"
+            _download_file(url, os.path.join(SENSEVOICE_MODEL_DIR, filename))
+        except Exception as e:
+            last_error = e
+    missing = [f for f in SENSEVOICE_MODEL_FILES
+               if not os.path.exists(os.path.join(SENSEVOICE_MODEL_DIR, f))]
+    if missing:
+        raise RuntimeError(f"以下模型文件始终下载不全，请稍后重试：{missing}") from last_error
+
+
+def diarization_model_ready():
+    return os.path.exists(DIARIZATION_SEGMENTATION_FILE) and os.path.exists(DIARIZATION_EMBEDDING_FILE)
+
+
+def _download_file(url, dest_path, on_progress=None):
+    """通用的流式下载+字节进度，跟download_audio()是同一个模式，抽出来给非音频文件复用"""
+    r = requests.get(url, stream=True, timeout=60, headers=HEADERS)
+    r.raise_for_status()
+    total_size = int(r.headers.get("content-length", 0))
+    downloaded = 0
+    with open(dest_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
+            downloaded += len(chunk)
+            if on_progress and total_size > 0:
+                on_progress(downloaded / total_size)
+
+
+def download_diarization_model(on_progress=None):
+    """下载说话人分离要用的两个模型：pyannote分割模型（判断"什么时候有人在说话、说话人有没有
+    切换"）+ 3D-Speaker声纹embedding模型（判断"是谁在说话"）。全部走GitHub Releases直链下载，
+    不需要HuggingFace账号/token，是跟whisper/SenseVoice完全独立的第三套模型。"""
+    os.makedirs(DIARIZATION_MODEL_DIR, exist_ok=True)
+
+    if not os.path.exists(DIARIZATION_SEGMENTATION_FILE):
+        seg_archive = os.path.join(DIARIZATION_MODEL_DIR, "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2")
+        _download_file(DIARIZATION_SEGMENTATION_URL, seg_archive, on_progress)
+        with tarfile.open(seg_archive) as tf:
+            tf.extractall(DIARIZATION_MODEL_DIR)
+        os.remove(seg_archive)
+
+    if not os.path.exists(DIARIZATION_EMBEDDING_FILE):
+        _download_file(DIARIZATION_EMBEDDING_URL, DIARIZATION_EMBEDDING_FILE, on_progress)
+
+    if not diarization_model_ready():
+        raise RuntimeError("说话人分离模型下载后校验未通过，请重试")
+
+
+def _load_diarization_model():
+    """加载说话人分离会话，跟_load_sensevoice_model()是并列的第三条模型加载路径，
+    纯CPU/ONNX，不依赖GPU"""
+    import sherpa_onnx
+
+    config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                model=DIARIZATION_SEGMENTATION_FILE
+            ),
+        ),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=DIARIZATION_EMBEDDING_FILE),
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=DIARIZATION_NUM_SPEAKERS, threshold=0.5),
+        min_duration_on=0.3,
+        min_duration_off=0.5,
+    )
+    if not config.validate():
+        raise RuntimeError("说话人分离模型配置校验失败，请确认models/diarization下的模型文件完整")
+    return sherpa_onnx.OfflineSpeakerDiarization(config)
+
+
+def _decode_mono_16k_array(audio_path):
+    """解码任意格式音频成16kHz单声道float32 numpy数组——说话人分离模型直接吃这个格式的数组输入，
+    不像SenseVoice那边的VAD要求喂文件路径"""
+    import av
+    import numpy as np
+
+    container = av.open(audio_path)
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+    chunks = []
+    for frame in container.decode(audio=0):
+        for rframe in resampler.resample(frame):
+            chunks.append(rframe.to_ndarray())
+    container.close()
+    pcm = np.concatenate(chunks, axis=1).flatten()
+    return pcm.astype(np.float32) / 32768.0
+
+
+def diarize_audio(sd, audio_path, on_progress=None):
+    """跑说话人分离，返回[(start, end, speaker_id), ...]，时间单位秒。这一步完全不产生/
+    修改任何转录时间戳，只是对同一段音频单独做一次分析，出来的结果之后靠assign_speakers()
+    按时间重叠去匹配转录segment"""
+    waveform = _decode_mono_16k_array(audio_path)
+    if sd.sample_rate != 16000:
+        raise RuntimeError(f"说话人分离模型要求采样率{sd.sample_rate}Hz，跟解码逻辑假设的16000不一致")
+
+    def _cb(num_processed_chunk, num_total_chunks):
+        if on_progress and num_total_chunks:
+            on_progress(num_processed_chunk / num_total_chunks)
+        return 0
+
+    result = sd.process(waveform, callback=_cb).sort_by_start_time()
+    return [(r.start, r.end, r.speaker) for r in result]
+
+
+def assign_speakers(segments, diar_result):
+    """给每句转录segment按时间重叠度贴一个说话人标签，不改动segment原有的start/end时间戳。
+    重叠度最高的说话人胜出；完全没有重叠（比如VAD切分误差导致的缝隙）就留空，不强行瞎猜"""
+    for seg in segments:
+        best_overlap = 0.0
+        best_speaker = None
+        for d_start, d_end, speaker_id in diar_result:
+            overlap = min(seg["end"], d_end) - max(seg["start"], d_start)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = speaker_id
+        seg["speaker"] = f"说话人{best_speaker + 1}" if best_speaker is not None else ""
+    return segments
 
 
 _SENSEVOICE_LANG_CODES = {"auto": 0, "zh": 3, "en": 4}
@@ -1081,13 +1232,28 @@ def main():
             )
 
             if detected_lang == "zh":
-                progress.update("识别到中文，跳过翻译", 0.95)
+                progress.update("识别到中文，跳过翻译", 0.85)
             else:
-                progress.update("翻译中", 0.8)
+                progress.update("翻译中", 0.7)
                 segments = translate_segments(
                     segments,
-                    on_progress=lambda p: progress.update(f"翻译中 {int(p*100)}%", 0.8 + p * 0.2),
+                    on_progress=lambda p: progress.update(f"翻译中 {int(p*100)}%", 0.7 + p * 0.15),
                 )
+
+            diarization_used = False
+            if ENABLE_DIARIZATION:
+                try:
+                    progress.update("识别说话人...", 0.87)
+                    diar_session = _load_diarization_model()
+                    diar_result = diarize_audio(
+                        diar_session, audio_path,
+                        on_progress=lambda p: progress.update(f"识别说话人 {int(p*100)}%", 0.87 + p * 0.1),
+                    )
+                    segments = assign_speakers(segments, diar_result)
+                    diarization_used = True
+                except Exception as e:
+                    # 说话人分离失败不阻断主流程，就当没开这个功能，正常出转录+翻译结果
+                    print(f"Speaker diarization failed, skipping: {e}")
 
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(segments, f, ensure_ascii=False, indent=2)
@@ -1102,6 +1268,7 @@ def main():
                     "processed_at": datetime.now().isoformat(),
                     "language": detected_lang,
                     "engine": TRANSCRIBE_ENGINE,
+                    "diarization": diarization_used,
                 },
                 episode_dir,
             )
@@ -1140,7 +1307,8 @@ def _emit_json(payload):
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-def run_manual_job(show_name, episode_title, source_type, source, published="", language="auto", engine="whisper"):
+def run_manual_job(show_name, episode_title, source_type, source, published="", language="auto", engine="whisper",
+                    enable_diarization=None):
     """手动任务模式的核心逻辑：不检查RSS、不循环多个节目，只处理指定的这一个音频。
     被 setup_wizard.py 当独立子进程调用——这样GUI本身不需要打包faster-whisper/ctranslate2这些
     体积巨大的转录依赖，也不用操心CUDA运行库有没有被打包进exe，因为跑的就是真实python环境。
@@ -1197,12 +1365,27 @@ def run_manual_job(show_name, episode_title, source_type, source, published="", 
         on_progress=lambda p: _emit_json({"stage": f"转录中 {int(p * 100)}%", "progress": 0.2 + p * 0.6}),
     )
     if detected_lang == "zh":
-        _emit_json({"stage": "识别到中文，跳过翻译", "progress": 0.95})
+        _emit_json({"stage": "识别到中文，跳过翻译", "progress": 0.85})
     else:
         segments = translate_segments(
             segments,
-            on_progress=lambda p: _emit_json({"stage": f"翻译中 {int(p * 100)}%", "progress": 0.8 + p * 0.2}),
+            on_progress=lambda p: _emit_json({"stage": f"翻译中 {int(p * 100)}%", "progress": 0.7 + p * 0.15}),
         )
+
+    do_diarization = ENABLE_DIARIZATION if enable_diarization is None else enable_diarization
+    diarization_used = False
+    if do_diarization:
+        try:
+            _emit_json({"stage": "识别说话人...", "progress": 0.87})
+            diar_session = _load_diarization_model()
+            diar_result = diarize_audio(
+                diar_session, audio_dest,
+                on_progress=lambda p: _emit_json({"stage": f"识别说话人 {int(p * 100)}%", "progress": 0.87 + p * 0.1}),
+            )
+            segments = assign_speakers(segments, diar_result)
+            diarization_used = True
+        except Exception as e:
+            print(f"Speaker diarization failed, skipping: {e}")
 
     with open(os.path.join(episode_dir, "data.json"), "w", encoding="utf-8") as f:
         json.dump(segments, f, ensure_ascii=False, indent=2)
@@ -1220,6 +1403,7 @@ def run_manual_job(show_name, episode_title, source_type, source, published="", 
             "processed_at": datetime.now().isoformat(),
             "language": detected_lang,
             "engine": engine,
+            "diarization": diarization_used,
         },
         episode_dir,
     )
@@ -1239,11 +1423,14 @@ if __name__ == "__main__":
         parser.add_argument("--published", default="")
         parser.add_argument("--language", default="auto", choices=["auto", "en", "zh"])
         parser.add_argument("--engine", default="whisper", choices=["whisper", "sensevoice"])
+        parser.add_argument("--enable-diarization", dest="enable_diarization", action="store_true", default=None)
+        parser.add_argument("--no-diarization", dest="enable_diarization", action="store_false")
         cli_args = parser.parse_args()
         try:
             run_manual_job(
                 cli_args.show, cli_args.title, cli_args.source_type, cli_args.source,
                 published=cli_args.published, language=cli_args.language, engine=cli_args.engine,
+                enable_diarization=cli_args.enable_diarization,
             )
         except Exception as e:
             _emit_json({"error": str(e)})

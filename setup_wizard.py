@@ -12,7 +12,9 @@ import re
 import sys
 import json
 import ctypes
+import io
 import zipfile
+import tarfile
 import subprocess
 import threading
 import feedparser
@@ -55,6 +57,16 @@ SENSEVOICE_MODEL_FILES = [
     "embedding.npy", "sense-voice-encoder-int8.onnx", "chn_jpn_yue_eng_ko_spectok.bpe.model",
     "fsmnvad-offline.onnx", "am.mvn", "fsmn-am.mvn", "fsmn-config.yaml",
 ]
+
+DIARIZATION_MODEL_DIR = os.path.join(MODELS_DIR, "diarization")
+DIARIZATION_SEGMENTATION_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+DIARIZATION_EMBEDDING_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+DIARIZATION_SEGMENTATION_FILE = os.path.join(
+    DIARIZATION_MODEL_DIR, "sherpa-onnx-pyannote-segmentation-3-0", "model.onnx"
+)
+DIARIZATION_EMBEDDING_FILE = os.path.join(
+    DIARIZATION_MODEL_DIR, "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+)
 
 RSS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -378,29 +390,107 @@ def start_sensevoice_download(state):
             outer_state = state
 
             class ProgressTqdm(tqdm):
+                def __init__(self, *args, **kwargs):
+                    # 打包成--windowed的exe没有控制台，sys.stdout/stderr是None，tqdm默认往
+                    # stderr写字符画进度条会直接AttributeError。这里强制换成一个不写到任何真实
+                    # 输出的假文件对象——反正进度是靠下面update()里的outer_state传给GUI的，
+                    # tqdm自己那份文字进度条从来没打算给用户看
+                    kwargs["file"] = io.StringIO()
+                    super().__init__(*args, **kwargs)
+
                 def update(self, n=1):
                     super().update(n)
                     if self.total:
                         outer_state.progress = self.n / self.total
                     outer_state.desc = self.desc or "下载中"
 
-            # 实测HF镜像偶尔会在几个KB大小的小文件上抽风（HEAD请求404几次），大文件反而没事，
-            # 按文件校验+重试几次基本都能过，不能假设snapshot_download一次就齐活
+            # 实测HF镜像偶尔会在几个KB大小的小文件上一直卡在HEAD请求这一步（snapshot_download
+            # 内部靠HEAD判断文件是否存在），同一个文件重试多少次都一样；直接GET
+            # resolve/main/<文件名>这个URL反而每次都成功，绕开了HEAD——重试几轮snapshot_download
+            # 还是缺文件的话，最后退化成对每个缺失文件直接GET
             os.makedirs(SENSEVOICE_MODEL_DIR, exist_ok=True)
             missing = SENSEVOICE_MODEL_FILES
             for _attempt in range(4):
-                snapshot_download(
-                    repo_id=SENSEVOICE_REPO,
-                    local_dir=SENSEVOICE_MODEL_DIR,
-                    allow_patterns=missing,
-                    tqdm_class=ProgressTqdm,
-                )
+                try:
+                    snapshot_download(
+                        repo_id=SENSEVOICE_REPO,
+                        local_dir=SENSEVOICE_MODEL_DIR,
+                        allow_patterns=missing,
+                        tqdm_class=ProgressTqdm,
+                    )
+                except Exception:
+                    pass
                 missing = [f for f in SENSEVOICE_MODEL_FILES
                            if not os.path.exists(os.path.join(SENSEVOICE_MODEL_DIR, f))]
                 if not missing:
                     break
-            else:
+            if missing:
+                for filename in missing:
+                    url = f"{os.environ['HF_ENDPOINT']}/{SENSEVOICE_REPO}/resolve/main/{filename}"
+                    resp = requests.get(url, stream=True, timeout=60)
+                    resp.raise_for_status()
+                    with open(os.path.join(SENSEVOICE_MODEL_DIR, filename), "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                missing = [f for f in SENSEVOICE_MODEL_FILES
+                           if not os.path.exists(os.path.join(SENSEVOICE_MODEL_DIR, f))]
+            if missing:
                 raise RuntimeError(f"以下模型文件始终下载不全，请稍后重试：{missing}")
+            state.progress = 1.0
+            state.done = True
+        except Exception as e:
+            state.error = str(e)
+        finally:
+            state.running = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def diarization_model_is_downloaded():
+    return os.path.exists(DIARIZATION_SEGMENTATION_FILE) and os.path.exists(DIARIZATION_EMBEDDING_FILE)
+
+
+def start_diarization_download(state):
+    """说话人分离模型走GitHub Releases直链，不是huggingface_hub那套，下载方式跟
+    start_model_download/start_sensevoice_download不一样：这里是普通的流式HTTP下载，
+    分割模型下下来是个tar.bz2还要解压一步"""
+    state.running = True
+    state.progress = 0.0
+    state.desc = "准备下载..."
+    state.done = False
+    state.error = None
+
+    def worker():
+        try:
+            os.makedirs(DIARIZATION_MODEL_DIR, exist_ok=True)
+
+            def _download_file(url, dest_path, weight_start, weight_end):
+                r = requests.get(url, stream=True, timeout=60)
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                done = 0
+                with open(dest_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            state.progress = weight_start + (done / total) * (weight_end - weight_start)
+
+            if not os.path.exists(DIARIZATION_SEGMENTATION_FILE):
+                state.desc = "下载说话人分割模型..."
+                seg_archive = os.path.join(DIARIZATION_MODEL_DIR, "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2")
+                _download_file(DIARIZATION_SEGMENTATION_URL, seg_archive, 0.0, 0.5)
+                state.desc = "解压中..."
+                with tarfile.open(seg_archive) as tf:
+                    tf.extractall(DIARIZATION_MODEL_DIR)
+                os.remove(seg_archive)
+
+            if not os.path.exists(DIARIZATION_EMBEDDING_FILE):
+                state.desc = "下载声纹embedding模型..."
+                _download_file(DIARIZATION_EMBEDDING_URL, DIARIZATION_EMBEDDING_FILE, 0.5, 1.0)
+
+            if not diarization_model_is_downloaded():
+                raise RuntimeError("下载后校验未通过，请重试")
             state.progress = 1.0
             state.done = True
         except Exception as e:
@@ -436,6 +526,14 @@ def start_model_download(size, state):
             outer_state = state
 
             class ProgressTqdm(tqdm):
+                def __init__(self, *args, **kwargs):
+                    # 打包成--windowed的exe没有控制台，sys.stdout/stderr是None，tqdm默认往
+                    # stderr写字符画进度条会直接AttributeError。这里强制换成一个不写到任何真实
+                    # 输出的假文件对象——反正进度是靠下面update()里的outer_state传给GUI的，
+                    # tqdm自己那份文字进度条从来没打算给用户看
+                    kwargs["file"] = io.StringIO()
+                    super().__init__(*args, **kwargs)
+
                 def update(self, n=1):
                     super().update(n)
                     if self.total:
@@ -471,6 +569,7 @@ class SetupWizard:
     def __init__(self, container):
         self.download_state = DownloadState()
         self.sensevoice_download_state = DownloadState()
+        self.diarization_download_state = DownloadState()
         self.parent = make_scrollable(container)
 
         self._build_feeds_section()
@@ -478,6 +577,7 @@ class SetupWizard:
         self._build_engine_section()
         self._build_model_section()
         self._build_sensevoice_section()
+        self._build_diarization_section()
         self._build_runtime_section()
         self._build_schedule_section()
         self._build_bottom_buttons()
@@ -493,8 +593,12 @@ class SetupWizard:
         self.model_size_var.set(config.get("whisper_model_size", "large-v3"))
         self._refresh_model_status()
         self._refresh_sensevoice_status()
+        self._refresh_diarization_status()
         self.engine_var.set(ENGINE_LABELS.get(config.get("transcribe_engine", "whisper"), ENGINE_LABELS["whisper"]))
         self.language_var.set(LANGUAGE_LABELS.get(config.get("language", "auto"), LANGUAGE_LABELS["auto"]))
+        self.diarization_enabled_var.set(config.get("enable_diarization", False))
+        num_speakers = config.get("diarization_num_speakers", -1)
+        self.diarization_num_speakers_var.set(str(num_speakers) if num_speakers and num_speakers > 0 else "")
         self.python_exe_var.set(config.get("python_exe", ""))
         self._refresh_schedule_from_task()
 
@@ -625,7 +729,7 @@ class SetupWizard:
         self.engine_var = tk.StringVar(value=ENGINE_LABELS["whisper"])
         ttk.Combobox(
             engine_row, textvariable=self.engine_var,
-            values=list(ENGINE_LABELS.values()), state="readonly", width=28,
+            values=list(ENGINE_LABELS.values()), state="readonly", width=40,
         ).pack(side="left", padx=(4, 10))
 
         lang_row = ttk.Frame(frame)
@@ -720,6 +824,75 @@ class SetupWizard:
         if state.running:
             self.sensevoice_download_status_label.config(text=f"下载中... {state.desc}", style="Muted.TLabel")
             self.parent.after(200, self._poll_sensevoice_download)
+
+    # ---------------- 说话人区分 ----------------
+    def _build_diarization_section(self):
+        frame = ttk.LabelFrame(self.parent, text="说话人区分（可选，纯CPU，不影响时间戳/实时字幕）")
+        frame.pack(fill="x", padx=14, pady=7)
+
+        toggle_row = ttk.Frame(frame)
+        toggle_row.pack(fill="x", padx=10, pady=(10, 0))
+        self.diarization_enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            toggle_row, text="启用说话人区分", variable=self.diarization_enabled_var,
+        ).pack(side="left")
+        ttk.Label(toggle_row, text="说话人数量（留空=自动判断）").pack(side="left", padx=(20, 4))
+        self.diarization_num_speakers_var = tk.StringVar(value="")
+        ttk.Entry(toggle_row, textvariable=self.diarization_num_speakers_var, width=6).pack(side="left")
+
+        ttk.Label(
+            frame, style="Muted.TLabel", wraplength=680, justify="left",
+            text="跟Whisper/SenseVoice哪个引擎都能配合，是转录完之后单独对同一段音频再跑一遍分析，"
+                 "只给每句话加一个「说话人N」标签，不会改动已经生成的时间戳，字幕同步不受影响。"
+                 "准确率不是100%——声音相似或者抢话严重的时候容易分错，多人辩论类节目要有心理准备。"
+                 "会额外增加一段处理时间，默认关闭。",
+        ).pack(anchor="w", padx=10, pady=(6, 10))
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(row, text="模型：pyannote分割 + 3D-Speaker声纹（约45MB）").pack(side="left")
+
+        self.diarization_status_label = ttk.Label(row, text="")
+        self.diarization_status_label.pack(side="left", padx=(10, 10))
+
+        self.diarization_download_btn = ttk.Button(
+            row, text="下载此模型", command=self._start_diarization_download,
+        )
+        self.diarization_download_btn.pack(side="left")
+
+        self.diarization_download_progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.diarization_download_progress.pack(fill="x", padx=10, pady=(0, 5))
+        self.diarization_download_status_label = ttk.Label(frame, text="", style="Muted.TLabel")
+        self.diarization_download_status_label.pack(anchor="w", padx=10, pady=(0, 10))
+
+    def _refresh_diarization_status(self):
+        if diarization_model_is_downloaded():
+            self.diarization_status_label.config(text="✅ 本地已有", style="Success.TLabel")
+            self.diarization_download_btn.config(state="disabled")
+        else:
+            self.diarization_status_label.config(text="⬇ 本地未下载", style="Warning.TLabel")
+            self.diarization_download_btn.config(state="normal")
+
+    def _start_diarization_download(self):
+        self.diarization_download_btn.config(state="disabled")
+        self.diarization_download_status_label.config(text="正在下载（约45MB）...", style="Muted.TLabel")
+        start_diarization_download(self.diarization_download_state)
+        self._poll_diarization_download()
+
+    def _poll_diarization_download(self):
+        state = self.diarization_download_state
+        self.diarization_download_progress["value"] = state.progress * 100
+        if state.error:
+            self.diarization_download_status_label.config(text=f"下载失败：{state.error}", style="Danger.TLabel")
+            self.diarization_download_btn.config(state="normal")
+            return
+        if state.done:
+            self.diarization_download_status_label.config(text="下载完成", style="Success.TLabel")
+            self._refresh_diarization_status()
+            return
+        if state.running:
+            self.diarization_download_status_label.config(text=f"下载中... {state.desc}", style="Muted.TLabel")
+            self.parent.after(200, self._poll_diarization_download)
 
     def _refresh_model_status(self):
         size = self.model_size_var.get()
@@ -924,11 +1097,18 @@ class SetupWizard:
         for item in self.feeds_tree.get_children():
             name, url = self.feeds_tree.item(item, "values")
             feeds[name] = url
+        num_speakers_text = self.diarization_num_speakers_var.get().strip()
+        try:
+            num_speakers = int(num_speakers_text) if num_speakers_text else -1
+        except ValueError:
+            num_speakers = -1
         return {
             "feeds": feeds,
             "whisper_model_size": self.model_size_var.get(),
             "transcribe_engine": ENGINE_VALUES_BY_LABEL.get(self.engine_var.get(), "whisper"),
             "language": LANGUAGE_VALUES_BY_LABEL.get(self.language_var.get(), "auto"),
+            "enable_diarization": self.diarization_enabled_var.get(),
+            "diarization_num_speakers": num_speakers,
             "python_exe": self.python_exe_var.get().strip(),
             "translation": {
                 "provider_name": self.preset_var.get(),
@@ -1375,11 +1555,12 @@ def _process_one_job(python_exe, job, on_stage):
     config = load_existing_config()
     language = config.get("language", "auto")
     engine = config.get("transcribe_engine", "whisper")
+    diarization_flag = "--enable-diarization" if config.get("enable_diarization", False) else "--no-diarization"
     args = [
         python_exe, DAILY_PODCAST_PATH, "--manual-job",
         "--show", job.show_name, "--title", job.episode_title,
         "--source-type", job.source_type, "--source", source_arg,
-        "--published", job.published, "--language", language, "--engine", engine,
+        "--published", job.published, "--language", language, "--engine", engine, diarization_flag,
     ]
     env = build_subprocess_env(python_exe)
     proc = subprocess.Popen(
