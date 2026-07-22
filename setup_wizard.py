@@ -89,6 +89,11 @@ ENGINE_LABELS = {
 }
 ENGINE_VALUES_BY_LABEL = {v: k for k, v in ENGINE_LABELS.items()}
 
+# yt-dlp下载视频链接时可选带上哪个浏览器的登录cookies，缓解YouTube的机器人拦截；
+# 配置文件里存value（yt-dlp认的浏览器名），下拉框显示label
+YTDLP_COOKIES_LABELS = {"": "不使用（默认）", "chrome": "Chrome", "edge": "Edge", "firefox": "Firefox"}
+YTDLP_COOKIES_VALUES_BY_LABEL = {v: k for k, v in YTDLP_COOKIES_LABELS.items()}
+
 TRANSLATION_PRESETS = {
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "api_key_env": "DEEPSEEK_API_KEY"},
     "OpenAI": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "api_key_env": "OPENAI_API_KEY"},
@@ -578,6 +583,7 @@ class SetupWizard:
         self._build_model_section()
         self._build_sensevoice_section()
         self._build_diarization_section()
+        self._build_ytdlp_section()
         self._build_runtime_section()
         self._build_schedule_section()
         self._build_bottom_buttons()
@@ -599,6 +605,9 @@ class SetupWizard:
         self.diarization_enabled_var.set(config.get("enable_diarization", False))
         num_speakers = config.get("diarization_num_speakers", -1)
         self.diarization_num_speakers_var.set(str(num_speakers) if num_speakers and num_speakers > 0 else "")
+        self.ytdlp_cookies_var.set(
+            YTDLP_COOKIES_LABELS.get(config.get("ytdlp_cookies_browser", ""), YTDLP_COOKIES_LABELS[""])
+        )
         self.python_exe_var.set(config.get("python_exe", ""))
         self._refresh_schedule_from_task()
 
@@ -925,6 +934,29 @@ class SetupWizard:
             self.download_status_label.config(text=f"下载中... {state.desc}", style="Muted.TLabel")
             self.parent.after(200, self._poll_download)
 
+    # ---------------- 视频链接下载 ----------------
+    def _build_ytdlp_section(self):
+        frame = ttk.LabelFrame(self.parent, text="视频链接下载（YouTube/B站，可选）")
+        frame.pack(fill="x", padx=14, pady=7)
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x", padx=10, pady=10)
+        ttk.Label(row, text="Cookies来源").pack(side="left")
+        self.ytdlp_cookies_var = tk.StringVar(value=YTDLP_COOKIES_LABELS[""])
+        ttk.Combobox(
+            row, textvariable=self.ytdlp_cookies_var,
+            values=list(YTDLP_COOKIES_LABELS.values()), state="readonly", width=16,
+        ).pack(side="left", padx=(4, 10))
+
+        ttk.Label(
+            frame, style="Muted.TLabel", wraplength=680, justify="left",
+            text="YouTube经常会把没有登录态的请求识别成「机器人」拦掉——选这里之后，下载YouTube/"
+                 "B站链接时会带上你选的这个浏览器里已登录的cookies，伪装成真实登录用户，能明显"
+                 "缓解拦截（不保证100%有效）。要求这台电脑上选的这个浏览器里当时保持着有效的登录"
+                 "状态；如果读取失败（比如Chrome开着的时候cookies被加密锁住），换Firefox试试通常"
+                 "更稳。B站一直很少遇到这个问题，不用也大多能下。",
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
     # ---------------- 运行环境 ----------------
     def _build_runtime_section(self):
         frame = ttk.LabelFrame(self.parent, text="运行环境（手动处理用来跑转录/翻译的Python）")
@@ -1107,6 +1139,7 @@ class SetupWizard:
             "language": LANGUAGE_VALUES_BY_LABEL.get(self.language_var.get(), "auto"),
             "enable_diarization": self.diarization_enabled_var.get(),
             "diarization_num_speakers": num_speakers,
+            "ytdlp_cookies_browser": YTDLP_COOKIES_VALUES_BY_LABEL.get(self.ytdlp_cookies_var.get(), ""),
             "python_exe": self.python_exe_var.get().strip(),
             "translation": {
                 "provider_name": self.preset_var.get(),
@@ -1814,7 +1847,11 @@ class SingleFilePane:
         def worker():
             try:
                 import yt_dlp
-                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+                ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+                cookies_browser = load_existing_config().get("ytdlp_cookies_browser", "")
+                if cookies_browser:
+                    ydl_opts["cookiesfrombrowser"] = (cookies_browser,)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                 title = (info or {}).get("title", "")
             except Exception:

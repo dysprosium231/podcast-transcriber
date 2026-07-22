@@ -88,6 +88,11 @@ SENSEVOICE_MODEL_FILES = [
 ENABLE_DIARIZATION = CONFIG.get("enable_diarization", False)
 DIARIZATION_NUM_SPEAKERS = CONFIG.get("diarization_num_speakers", -1)  # -1表示自动判断说话人数
 
+# 可选：yt-dlp下载视频链接时带上指定浏览器里已登录的cookies，伪装成真实登录用户请求，
+# 能明显缓解YouTube的"Sign in to confirm you're not a bot"拦截（不保证100%有效，且要求
+# 这台电脑上那个浏览器里保持着有效的YouTube登录状态）。留空就是不带cookies，跟以前一样
+YTDLP_COOKIES_BROWSER = CONFIG.get("ytdlp_cookies_browser", "")
+
 DIARIZATION_MODEL_DIR = os.path.join(SCRIPT_DIR, "models", "diarization")
 DIARIZATION_SEGMENTATION_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
 DIARIZATION_EMBEDDING_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
@@ -580,6 +585,8 @@ def download_via_ytdlp(url, dest_dir, on_progress=None):
         "no_warnings": True,
         "noplaylist": True,  # 链接如果是播放列表里的一个视频，只下这一个，不是整个列表
     }
+    if YTDLP_COOKIES_BROWSER:
+        ydl_opts["cookiesfrombrowser"] = (YTDLP_COOKIES_BROWSER,)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
