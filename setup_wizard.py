@@ -13,6 +13,8 @@ import sys
 import json
 import ctypes
 import io
+import glob
+import shutil
 import zipfile
 import tarfile
 import subprocess
@@ -164,6 +166,16 @@ def apply_modern_style(root):
     style.map(
         "Accent.TButton",
         background=[("active", COLORS["accent_hover"]), ("disabled", COLORS["border"])],
+        foreground=[("disabled", COLORS["fg_muted"])],
+    )
+
+    style.configure(
+        "Danger.TButton", background=COLORS["danger"], foreground="#ffffff",
+        borderwidth=0, focuscolor=COLORS["bg"], padding=(11, 7), font=("Segoe UI", 10),
+    )
+    style.map(
+        "Danger.TButton",
+        background=[("active", COLORS["danger"]), ("disabled", COLORS["bg_elevated"])],
         foreground=[("disabled", COLORS["fg_muted"])],
     )
 
@@ -1182,6 +1194,15 @@ class SetupWizard:
         messagebox.showinfo("完成", msg)
 
 
+def _find_audio_file(ep_path):
+    """音频文件名固定叫"audio"，但扩展名不固定——本地文件/RSS下载是mp3，yt-dlp下载的视频链接
+    跟着源格式走（m4a/webm等），不能写死"audio.mp3"去找，得按前缀glob"""
+    if not ep_path:
+        return None
+    matches = glob.glob(os.path.join(ep_path, "audio.*"))
+    return matches[0] if matches else None
+
+
 def _episode_meta(ep_path):
     """读一个期数文件夹里的meta.json（daily_podcast.py处理完会写这个）。旧数据（这个功能
     上线之前处理的）没有这个文件，返回空字典，调用方要按"什么日期信息都没有"来处理，不能假设
@@ -1285,23 +1306,32 @@ class HomeTab:
         self.open_vtt_btn.pack(side="left", padx=(8, 0))
         self.open_folder_btn = ttk.Button(btn_row, text="打开所在文件夹", command=self._open_folder, state="disabled")
         self.open_folder_btn.pack(side="left", padx=(8, 0))
+        self.delete_btn = ttk.Button(
+            btn_row, text="删除", style="Danger.TButton", command=self._delete_selected, state="disabled",
+        )
+        self.delete_btn.pack(side="right")
 
         self.status_label = ttk.Label(parent, text="", style="Muted.TLabel")
         self.status_label.pack(anchor="w", padx=14, pady=(0, 14))
 
         self._node_paths = {}  # tree节点id -> 期数文件夹绝对路径（只有期数这一级子节点才有，
-                                # 节目名那一级父节点不在这里面，选中父节点时按钮全部禁用）
+                                # 节目名那一级父节点不在这里面）
+        self._show_paths = {}  # 节目名这一级父节点id -> 整个节目文件夹绝对路径，专门给"删除整个
+                                # 节目"用；跟_node_paths分开存，因为选中父节点时其它按钮（播放/打开
+                                # 字幕等）还是要禁用的，只有删除操作父子节点都认
         self.refresh()
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         self._node_paths.clear()
+        self._show_paths.clear()
         episodes = scan_episodes()  # 已经按 节目名→日期新到旧 分组排好序
 
         shows = {}  # 节目名 -> 这个节目在tree里的父节点id
         for show_name, ep_title, ep_path, display_date in episodes:
             if show_name not in shows:
                 shows[show_name] = self.tree.insert("", "end", text=show_name, open=True)
+                self._show_paths[shows[show_name]] = os.path.dirname(ep_path)
             ep_node = self.tree.insert(shows[show_name], "end", text=ep_title, values=(display_date,))
             self._node_paths[ep_node] = ep_path
 
@@ -1330,7 +1360,7 @@ class HomeTab:
     def _update_buttons_state(self):
         path = self._selected_episode_path()
         has_subtitles = bool(path) and os.path.exists(os.path.join(path, "subtitles.html"))
-        has_audio = bool(path) and os.path.exists(os.path.join(path, "audio.mp3"))
+        has_audio = bool(_find_audio_file(path))
         has_srt = bool(path) and os.path.exists(os.path.join(path, "subtitles.srt"))
         has_vtt = bool(path) and os.path.exists(os.path.join(path, "subtitles.vtt"))
         self.open_subtitles_btn.config(state="normal" if has_subtitles else "disabled")
@@ -1338,6 +1368,11 @@ class HomeTab:
         self.open_srt_btn.config(state="normal" if has_srt else "disabled")
         self.open_vtt_btn.config(state="normal" if has_vtt else "disabled")
         self.open_folder_btn.config(state="normal" if path else "disabled")
+        # 删除按钮播放/打开这些按钮不一样——选中节目名这个父节点时（单期那些操作没意义所以禁用）
+        # 删除还是要能用的，删的是整个节目
+        sel = self.tree.selection()
+        can_delete = bool(sel) and (sel[0] in self._node_paths or sel[0] in self._show_paths)
+        self.delete_btn.config(state="normal" if can_delete else "disabled")
 
     def _open_subtitles(self):
         path = self._selected_episode_path()
@@ -1349,10 +1384,8 @@ class HomeTab:
 
     def _open_audio(self):
         path = self._selected_episode_path()
-        if not path:
-            return
-        target = os.path.join(path, "audio.mp3")
-        if os.path.exists(target):
+        target = _find_audio_file(path)
+        if target:
             os.startfile(target)
 
     def _open_srt(self):
@@ -1375,6 +1408,45 @@ class HomeTab:
         path = self._selected_episode_path()
         if path:
             os.startfile(path)
+
+    def _delete_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        node = sel[0]
+
+        if node in self._node_paths:
+            # 选中的是某一期
+            path = self._node_paths[node]
+            show_name = self.tree.item(self.tree.parent(node), "text")
+            ep_title = self.tree.item(node, "text")
+            confirmed = messagebox.askyesno(
+                "确认删除",
+                f"确定要删除「{show_name}」下的这一期吗？\n\n{ep_title}\n\n"
+                "音频、字幕、转录文稿等全部文件都会被删除，此操作不可恢复。",
+                icon="warning",
+            )
+        elif node in self._show_paths:
+            # 选中的是整个节目（父节点）
+            path = self._show_paths[node]
+            show_label = self.tree.item(node, "text")  # 已经带了"（N期）"后缀，直接用
+            confirmed = messagebox.askyesno(
+                "确认删除",
+                f"确定要删除整个节目吗？\n\n{show_label}\n\n"
+                "这会删除该节目下所有期数的音频、字幕、转录文稿，此操作不可恢复。",
+                icon="warning",
+            )
+        else:
+            return
+
+        if not confirmed:
+            return
+        try:
+            shutil.rmtree(path)
+        except Exception as e:
+            messagebox.showerror("删除失败", str(e))
+            return
+        self.refresh()
 
 
 AUDIO_FILE_TYPES = [
