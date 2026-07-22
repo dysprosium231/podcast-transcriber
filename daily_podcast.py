@@ -67,6 +67,8 @@ MODEL_PATH = _LOCAL_MODEL_DIR if _LOCAL_MODEL_READY else _WHISPER_MODEL_SIZE
 EPISODES_DIR = "episodes"  # 结构: episodes/节目名/期数标题/
 LATEST_LOG = "latest_episodes.txt"
 
+LANGUAGE = CONFIG.get("language", "auto")  # "auto"/"en"/"zh"，只支持这两种语言+自动识别
+
 TRANSLATION_CONFIG = CONFIG.get("translation", {})
 TRANSLATION_PROVIDER_NAME = TRANSLATION_CONFIG.get("provider_name", "翻译服务")
 TRANSLATION_MODEL = TRANSLATION_CONFIG.get("model")
@@ -441,10 +443,28 @@ def save_latest_log(log):
             f.write(f"{show}::{title}\n")
 
 
+def resolve_apple_podcasts_feed(url):
+    """如果传进来的是苹果播客链接（podcasts.apple.com/.../idNNNNNN），通过苹果公开的
+    iTunes Lookup API查出这档播客真正的RSS地址并返回；不是苹果链接就原样返回，调用方
+    不需要先判断类型，直接无脑传进来就行。苹果播客本身也是靠RSS分发的，只是套了一层
+    自己的网页/App壳子——这个查询接口是苹果公开、免注册、免Key的。"""
+    match = re.search(r"podcasts\.apple\.com/[^\s]*?/id(\d+)", url)
+    if not match:
+        return url
+    podcast_id = match.group(1)
+    resp = requests.get(f"https://itunes.apple.com/lookup?id={podcast_id}", timeout=15, headers=HEADERS)
+    resp.raise_for_status()
+    results = resp.json().get("results") or []
+    if not results or not results[0].get("feedUrl"):
+        raise ValueError("这个苹果播客ID没有查到对应的RSS地址（可能不是播客节目，或者苹果没公开这个字段）")
+    return results[0]["feedUrl"]
+
+
 def get_all_episodes(rss_url):
     """取整个RSS feed的完整历史条目列表（不只是最新一条）。自己用requests取内容再交给
     feedparser解析（而不是让feedparser直接拿URL），因为feedparser内置的URL抓取不设超时，
     网络卡住时会无限期挂住"""
+    rss_url = resolve_apple_podcasts_feed(rss_url)
     r = requests.get(rss_url, timeout=30, headers=HEADERS)
     r.raise_for_status()
     feed = feedparser.parse(r.content)
@@ -501,14 +521,57 @@ def download_audio(url, filepath, retry_rss_url=None, max_retries=2, on_progress
                 raise
 
 
-def transcribe_audio(model, audio_path, on_progress=None):
-    """转录，返回带时间戳的逐句列表。on_progress(0~1) 每次进度有明显变化时回调"""
+def download_via_ytdlp(url, dest_dir, on_progress=None):
+    """从YouTube/B站等yt-dlp支持的网站链接下载纯音频轨，存到dest_dir下（文件名由yt-dlp
+    自己根据视频标题决定，不是提前定好的），返回实际生成的文件完整路径。
+
+    只下音频不下视频（format选bestaudio），而且不额外转码成mp3——faster-whisper底层用
+    PyAV解码（跟着faster-whisper一起装的av这个包自带FFmpeg），本来就能直接吃yt-dlp下载
+    下来的原始格式（webm/m4a等），没必要在这一步额外转一遍格式，省时间也不用额外装ffmpeg。
+
+    yt-dlp自己根据链接域名识别是哪个网站，YouTube/B站等它支持的站点通用同一套调用方式，
+    不需要在这里区分是哪个平台。"""
+    import yt_dlp
+
+    result_path = {"value": None}
+
+    def hook(d):
+        if d["status"] == "downloading" and on_progress:
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if total:
+                on_progress(d.get("downloaded_bytes", 0) / total)
+        elif d["status"] == "finished":
+            result_path["value"] = d["filename"]
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(dest_dir, "%(title).100s.%(ext)s"),
+        "progress_hooks": [hook],
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,  # 链接如果是播放列表里的一个视频，只下这一个，不是整个列表
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    if not result_path["value"] or not os.path.exists(result_path["value"]):
+        raise RuntimeError("yt-dlp下载完成但没能定位到生成的文件，可能是链接不受支持")
+    return result_path["value"]
+
+
+def transcribe_audio(model, audio_path, language="auto", on_progress=None):
+    """转录，返回(带时间戳的逐句列表, 识别到的语言)。on_progress(0~1) 每次进度有明显变化时回调。
+    language: "auto"（交给whisper自动识别）/"en"/"zh"（跳过识别，直接按指定语言转录，短音频或
+    中英混杂时手动指定更准）。只支持中英两种语言——非中文一律按"en"分支处理（存进en字段），
+    这样后续翻译/字幕/播放页的逻辑不用为更多语言分支。"""
     segments, info = model.transcribe(
         audio_path,
-        language="en",
+        language=None if language == "auto" else language,
         batch_size=4,
         vad_filter=True,
     )
+    detected_lang = language if language != "auto" else (info.language or "en")
+    is_zh = detected_lang == "zh"
     total_duration = info.duration
     result = []
     last_reported = -1
@@ -516,10 +579,12 @@ def transcribe_audio(model, audio_path, on_progress=None):
     with tqdm(desc="转录进度", total=round(total_duration, 1), unit="秒") as bar:
         last_end = 0
         for seg in segments:
+            text = seg.text.strip()
             result.append({
                 "start": seg.start,
                 "end": seg.end,
-                "en": seg.text.strip(),
+                "en": "" if is_zh else text,
+                "zh": text if is_zh else "",
             })
             bar.update(round(seg.end - last_end, 1))
             last_end = seg.end
@@ -536,7 +601,7 @@ def transcribe_audio(model, audio_path, on_progress=None):
     if on_progress:
         on_progress(1.0)
 
-    return result
+    return result, detected_lang
 
 
 TRANSLATION_BASE_SYSTEM_PROMPT = (
@@ -600,6 +665,15 @@ def translate_segments(segments, on_progress=None):
     return segments
 
 
+def save_episode_meta(meta, episode_dir):
+    """存一份期数元数据（发布时间等），播客库列表要靠这个按时间排序/分组显示——RSS的
+    itunes:episode（真正的"第几期"编号）几乎没有播客在用（实测两个真实feed都没有），
+    没有更靠谱的数据源，只能退而求其次记发布时间。手动导入的本地音频没有RSS发布时间，
+    published留空，用processed_at（导入时刻）兜底排序。"""
+    with open(os.path.join(episode_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
 def save_text_files(segments, en_path, zh_path):
     """保存纯英文稿和纯中文稿两个txt文件"""
     with open(en_path, "w", encoding="utf-8") as f:
@@ -607,6 +681,41 @@ def save_text_files(segments, en_path, zh_path):
 
     with open(zh_path, "w", encoding="utf-8") as f:
         f.write(" ".join(seg["zh"] for seg in segments if seg["zh"]))
+
+
+def _format_timestamp(seconds, decimal_mark):
+    """把秒数转成字幕时间戳格式 HH:MM:SS<分隔符>mmm。SRT用逗号分隔毫秒，VTT用句点，
+    两种格式其它部分完全一样，所以共用同一个函数，靠decimal_mark参数区分"""
+    total_ms = round(seconds * 1000)
+    hours, rem_ms = divmod(total_ms, 3600_000)
+    minutes, rem_ms = divmod(rem_ms, 60_000)
+    secs, ms = divmod(rem_ms, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}{decimal_mark}{ms:03d}"
+
+
+def _subtitle_cue_text(seg):
+    """英文+中文各一行；某一行缺失（翻译失败，或源语言本来就是中文没有英文）就只留有内容的那行，
+    不留空行占位"""
+    return "\n".join(line for line in (seg["en"], seg["zh"]) if line)
+
+
+def generate_srt(segments, output_path):
+    """标准SRT字幕，可以直接拖进大部分视频播放器/剪辑软件，一句英文一句中文对照"""
+    with open(output_path, "w", encoding="utf-8") as f:
+        for i, seg in enumerate(segments, start=1):
+            start = _format_timestamp(seg["start"], ",")
+            end = _format_timestamp(seg["end"], ",")
+            f.write(f"{i}\n{start} --> {end}\n{_subtitle_cue_text(seg)}\n\n")
+
+
+def generate_vtt(segments, output_path):
+    """WebVTT字幕，跟SRT内容一样，格式上是网页<track>标签和部分播放器更认的那种"""
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n")
+        for i, seg in enumerate(segments, start=1):
+            start = _format_timestamp(seg["start"], ".")
+            end = _format_timestamp(seg["end"], ".")
+            f.write(f"{i}\n{start} --> {end}\n{_subtitle_cue_text(seg)}\n\n")
 
 
 def generate_html(title, audio_filename, segments, output_path):
@@ -659,9 +768,13 @@ segments.forEach((seg, i) => {
   const div = document.createElement("div");
   div.className = "line";
   div.id = "line-" + i;
+  // 哪个字段有内容就用哪个当主行（大号黑字）；源语言本来就是中文时en是空的，
+  // 这时zh要顶替成主行，而不是照旧当小号灰字的翻译行
+  const primary = seg.en || seg.zh;
+  const secondary = (seg.en && seg.zh) ? seg.zh : "";
   div.innerHTML = `<span class="time">${formatTime(seg.start)}</span>
-                    <div class="en">${seg.en}</div>
-                    <div class="zh">${seg.zh || ""}</div>`;
+                    <div class="en">${primary}</div>
+                    <div class="zh">${secondary}</div>`;
   div.onclick = () => { audio.currentTime = seg.start; audio.play(); };
   transcript.appendChild(div);
 });
@@ -738,6 +851,7 @@ def _check_show(show_name, rss_url, latest_log):
         "audio_url": audio_url,
         "current_title": current_title,
         "episode_dir": episode_dir,
+        "published": newest.get("published", ""),
     }
 
 
@@ -790,6 +904,8 @@ def main():
         html_path = os.path.join(episode_dir, "subtitles.html")
         en_txt_path = os.path.join(episode_dir, "transcript_en.txt")
         zh_txt_path = os.path.join(episode_dir, "transcript_zh.txt")
+        srt_path = os.path.join(episode_dir, "subtitles.srt")
+        vtt_path = os.path.join(episode_dir, "subtitles.vtt")
 
         progress = FloatingProgress(f"「{show_name}」{current_title}")
 
@@ -801,22 +917,35 @@ def main():
             )
 
             progress.update("转录中（GPU运算）", 0.2)
-            segments = transcribe_audio(
-                batched_model, audio_path,
+            segments, detected_lang = transcribe_audio(
+                batched_model, audio_path, language=LANGUAGE,
                 on_progress=lambda p: progress.update(f"转录中 {int(p*100)}%", 0.2 + p * 0.6),
             )
 
-            progress.update("翻译中", 0.8)
-            segments = translate_segments(
-                segments,
-                on_progress=lambda p: progress.update(f"翻译中 {int(p*100)}%", 0.8 + p * 0.2),
-            )
+            if detected_lang == "zh":
+                progress.update("识别到中文，跳过翻译", 0.95)
+            else:
+                progress.update("翻译中", 0.8)
+                segments = translate_segments(
+                    segments,
+                    on_progress=lambda p: progress.update(f"翻译中 {int(p*100)}%", 0.8 + p * 0.2),
+                )
 
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(segments, f, ensure_ascii=False, indent=2)
 
             save_text_files(segments, en_txt_path, zh_txt_path)
             generate_html(current_title, audio_filename, segments, html_path)
+            generate_srt(segments, srt_path)
+            generate_vtt(segments, vtt_path)
+            save_episode_meta(
+                {
+                    "published": job.get("published", ""),
+                    "processed_at": datetime.now().isoformat(),
+                    "language": detected_lang,
+                },
+                episode_dir,
+            )
 
             latest_log[show_name] = current_title
             save_latest_log(latest_log)
@@ -852,11 +981,13 @@ def _emit_json(payload):
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-def run_manual_job(show_name, episode_title, source_type, source):
+def run_manual_job(show_name, episode_title, source_type, source, published="", language="auto"):
     """手动任务模式的核心逻辑：不检查RSS、不循环多个节目，只处理指定的这一个音频。
     被 setup_wizard.py 当独立子进程调用——这样GUI本身不需要打包faster-whisper/ctranslate2这些
     体积巨大的转录依赖，也不用操心CUDA运行库有没有被打包进exe，因为跑的就是真实python环境。
-    source_type: "local"（本地文件路径）/ "download"（音频URL）/ "zip"（"zip路径::压缩包内条目名"）"""
+    source_type: "local"（本地文件路径）/ "download"（音频URL）/ "zip"（"zip路径::压缩包内条目名"）
+    published: 可选，RSS历史下载场景下这一期原本的发布时间（GUI那边已经从RSS条目里读到了，
+    传过来存进meta.json）；本地文件/zip没有这个概念，留空，播客库改用处理时刻排序"""
     show_dir = os.path.join(EPISODES_DIR, show_name)
     os.makedirs(show_dir, exist_ok=True)
     safe_title = sanitize_filename(episode_title)
@@ -879,6 +1010,20 @@ def run_manual_job(show_name, episode_title, source_type, source):
         with zipfile.ZipFile(zip_path) as zf, zf.open(entry_name) as src, open(audio_dest, "wb") as dst:
             shutil.copyfileobj(src, dst)
         _emit_json({"stage": "准备转录...", "progress": 0.2})
+    elif source_type == "ytdlp":
+        _emit_json({"stage": "解析视频链接...", "progress": 0.02})
+        downloaded_path = download_via_ytdlp(
+            source, episode_dir,
+            on_progress=lambda p: _emit_json({"stage": f"下载中 {int(p * 100)}%", "progress": p * 0.2}),
+        )
+        # yt-dlp自己按视频标题决定文件名和扩展名，这里统一改名成audio.<原始扩展名>，
+        # 跟其它来源保持"文件名固定叫audio，只有扩展名不同"这个约定，方便播客库/其它
+        # 地方按固定文件名找音频，不用另外记一份"这一期音频文件到底叫什么"
+        ext = os.path.splitext(downloaded_path)[1] or ".m4a"
+        audio_filename = f"audio{ext}"
+        audio_dest = os.path.join(episode_dir, audio_filename)
+        if downloaded_path != audio_dest:
+            shutil.move(downloaded_path, audio_dest)
     else:  # download
         audio_filename = "audio.mp3"
         audio_dest = os.path.join(episode_dir, audio_filename)
@@ -890,14 +1035,17 @@ def run_manual_job(show_name, episode_title, source_type, source):
     model = WhisperModel(MODEL_PATH, device="cuda", compute_type="float16")
     batched_model = BatchedInferencePipeline(model=model)
 
-    segments = transcribe_audio(
-        batched_model, audio_dest,
+    segments, detected_lang = transcribe_audio(
+        batched_model, audio_dest, language=language,
         on_progress=lambda p: _emit_json({"stage": f"转录中 {int(p * 100)}%", "progress": 0.2 + p * 0.6}),
     )
-    segments = translate_segments(
-        segments,
-        on_progress=lambda p: _emit_json({"stage": f"翻译中 {int(p * 100)}%", "progress": 0.8 + p * 0.2}),
-    )
+    if detected_lang == "zh":
+        _emit_json({"stage": "识别到中文，跳过翻译", "progress": 0.95})
+    else:
+        segments = translate_segments(
+            segments,
+            on_progress=lambda p: _emit_json({"stage": f"翻译中 {int(p * 100)}%", "progress": 0.8 + p * 0.2}),
+        )
 
     with open(os.path.join(episode_dir, "data.json"), "w", encoding="utf-8") as f:
         json.dump(segments, f, ensure_ascii=False, indent=2)
@@ -907,6 +1055,12 @@ def run_manual_job(show_name, episode_title, source_type, source):
         os.path.join(episode_dir, "transcript_zh.txt"),
     )
     generate_html(episode_title, audio_filename, segments, os.path.join(episode_dir, "subtitles.html"))
+    generate_srt(segments, os.path.join(episode_dir, "subtitles.srt"))
+    generate_vtt(segments, os.path.join(episode_dir, "subtitles.vtt"))
+    save_episode_meta(
+        {"published": published, "processed_at": datetime.now().isoformat(), "language": detected_lang},
+        episode_dir,
+    )
     _emit_json({"done": True, "result_dir": episode_dir})
 
 
@@ -918,11 +1072,16 @@ if __name__ == "__main__":
         parser.add_argument("--manual-job", action="store_true")
         parser.add_argument("--show", required=True)
         parser.add_argument("--title", required=True)
-        parser.add_argument("--source-type", required=True, choices=["local", "download", "zip"])
+        parser.add_argument("--source-type", required=True, choices=["local", "download", "zip", "ytdlp"])
         parser.add_argument("--source", required=True)
+        parser.add_argument("--published", default="")
+        parser.add_argument("--language", default="auto", choices=["auto", "en", "zh"])
         cli_args = parser.parse_args()
         try:
-            run_manual_job(cli_args.show, cli_args.title, cli_args.source_type, cli_args.source)
+            run_manual_job(
+                cli_args.show, cli_args.title, cli_args.source_type, cli_args.source,
+                published=cli_args.published, language=cli_args.language,
+            )
         except Exception as e:
             _emit_json({"error": str(e)})
             sys.stdout.flush()

@@ -58,6 +58,10 @@ WHISPER_MODEL_CHOICES = [
     "medium", "medium.en", "large-v2", "large-v3", "distil-large-v3",
 ]
 
+# 只支持中英两种语言+自动识别；配置文件里存value（"auto"/"en"/"zh"），下拉框显示label
+LANGUAGE_LABELS = {"auto": "自动识别（推荐）", "en": "英文", "zh": "中文"}
+LANGUAGE_VALUES_BY_LABEL = {v: k for k, v in LANGUAGE_LABELS.items()}
+
 TRANSLATION_PRESETS = {
     "DeepSeek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "api_key_env": "DEEPSEEK_API_KEY"},
     "OpenAI": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "api_key_env": "OPENAI_API_KEY"},
@@ -212,6 +216,12 @@ def make_scrollable(container):
 
     canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
     canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+    # 内容发生大改动的时候（比如播客库刷新、RSS拉取到新一批entries）如果不主动挪回顶部，
+    # 用户停留的滚动位置很容易变成对着新内容里的一片空白（旧内容更长、滚动条停在下面，
+    # 刷新后新内容变短，那个位置就已经超出新内容范围了）。调用方在内容大改之后调一下
+    # 这个方法，滚回顶部，不留下莫名其妙的空白
+    inner.scroll_to_top = lambda: canvas.yview_moveto(0)
 
     return inner
 
@@ -411,6 +421,7 @@ class SetupWizard:
         self._populate_translation(config.get("translation", {}))
         self.model_size_var.set(config.get("whisper_model_size", "large-v3"))
         self._refresh_model_status()
+        self.language_var.set(LANGUAGE_LABELS.get(config.get("language", "auto"), LANGUAGE_LABELS["auto"]))
         self.python_exe_var.set(config.get("python_exe", ""))
         self._refresh_schedule_from_task()
 
@@ -556,6 +567,20 @@ class SetupWizard:
         self.download_progress.pack(fill="x", padx=10, pady=(0, 5))
         self.download_status_label = ttk.Label(frame, text="", style="Muted.TLabel")
         self.download_status_label.pack(anchor="w", padx=10, pady=(0, 10))
+
+        lang_row = ttk.Frame(frame)
+        lang_row.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(lang_row, text="转录语言").pack(side="left")
+        self.language_var = tk.StringVar(value=LANGUAGE_LABELS["auto"])
+        ttk.Combobox(
+            lang_row, textvariable=self.language_var,
+            values=list(LANGUAGE_LABELS.values()), state="readonly", width=16,
+        ).pack(side="left", padx=(4, 10))
+        ttk.Label(
+            frame, style="Muted.TLabel", wraplength=680, justify="left",
+            text="只支持中文/英文。自动识别是whisper转录时顺带判断的，不用额外花时间；"
+                 "如果源音频语言比较确定，手动指定能避免偶尔识别错。识别为中文时会自动跳过翻译这一步。",
+        ).pack(anchor="w", padx=10, pady=(0, 10))
 
     def _refresh_model_status(self):
         size = self.model_size_var.get()
@@ -763,6 +788,7 @@ class SetupWizard:
         return {
             "feeds": feeds,
             "whisper_model_size": self.model_size_var.get(),
+            "language": LANGUAGE_VALUES_BY_LABEL.get(self.language_var.get(), "auto"),
             "python_exe": self.python_exe_var.get().strip(),
             "translation": {
                 "provider_name": self.preset_var.get(),
@@ -803,8 +829,44 @@ class SetupWizard:
         messagebox.showinfo("完成", msg)
 
 
+def _episode_meta(ep_path):
+    """读一个期数文件夹里的meta.json（daily_podcast.py处理完会写这个）。旧数据（这个功能
+    上线之前处理的）没有这个文件，返回空字典，调用方要按"什么日期信息都没有"来处理，不能假设
+    一定有内容。"""
+    meta_path = os.path.join(ep_path, "meta.json")
+    if not os.path.exists(meta_path):
+        return {}
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _episode_date(ep_path):
+    """从meta.json解析出一个datetime，优先用RSS发布时间，没有就用处理时刻兜底。两种时间格式
+    不一样（RSS是"Tue, 21 Jul 2026 09:54:49 GMT"这种邮件日期格式，处理时刻是ISO格式），
+    都解析失败（或者压根没有meta.json）就返回None，调用方各自决定怎么兜底。"""
+    date_str = _episode_meta(ep_path).get("published") or _episode_meta(ep_path).get("processed_at") or ""
+    if not date_str:
+        return None
+    from datetime import datetime as _dt
+    from email.utils import parsedate_to_datetime
+    try:
+        return parsedate_to_datetime(date_str)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return _dt.fromisoformat(date_str)
+    except ValueError:
+        return None
+
+
 def scan_episodes():
-    """扫描 episodes/ 目录，返回 [(节目名, 期数标题, 文件夹绝对路径), ...]"""
+    """扫描 episodes/ 目录，返回 [(节目名, 期数标题, 文件夹绝对路径, 显示用日期字符串), ...]，
+    每个节目内部按日期新到旧排序——RSS的itunes:episode（严格意义上的"第几期"编号）几乎没播客在用
+    （实测过两个真实feed都没有），只能退而求其次用发布时间/处理时刻代替真正的期数。
+    没有日期信息的（旧数据）排在最后，按标题字母序。"""
     result = []
     if not os.path.isdir(EPISODES_DIR):
         return result
@@ -812,10 +874,22 @@ def scan_episodes():
         show_path = os.path.join(EPISODES_DIR, show_name)
         if not os.path.isdir(show_path):
             continue
-        for ep_title in sorted(os.listdir(show_path)):
+        ep_titles = [
+            t for t in os.listdir(show_path)
+            if os.path.isdir(os.path.join(show_path, t))
+        ]
+
+        def sort_key(title):
+            dt = _episode_date(os.path.join(show_path, title))
+            return (dt is None, -dt.timestamp() if dt else 0, title)
+
+        ep_titles.sort(key=sort_key)
+
+        for ep_title in ep_titles:
             ep_path = os.path.join(show_path, ep_title)
-            if os.path.isdir(ep_path):
-                result.append((show_name, ep_title, ep_path))
+            dt = _episode_date(ep_path)
+            display_date = dt.strftime("%Y-%m-%d") if dt else ""
+            result.append((show_name, ep_title, ep_path, display_date))
     return result
 
 
@@ -832,13 +906,14 @@ class HomeTab:
         ttk.Label(top, text="episodes/ 下已生成的节目", style="Heading.TLabel").pack(side="left")
         ttk.Button(top, text="刷新", command=self.refresh).pack(side="right")
 
-        # height=12（原来是22）：这个页签现在也套了外层滚动区域，Treeview不用靠自己撑满
-        # 所有行才能看全，超过12行外层滚动条就能接着看，不用把整个页签撑得比窗口还高
-        self.tree = ttk.Treeview(parent, columns=("show", "title"), show="headings", height=12)
-        self.tree.heading("show", text="节目")
-        self.tree.heading("title", text="期数标题")
-        self.tree.column("show", width=140)
-        self.tree.column("title", width=440)
+        # 按节目名分组显示（show="tree headings"）：节目是父节点（默认展开），期数是子节点。
+        # height=14：这个页签也套了外层滚动区域，Treeview不用靠自己撑满所有行才能看全，
+        # 超过14行外层滚动条就能接着看，不用把整个页签撑得比窗口还高
+        self.tree = ttk.Treeview(parent, columns=("date",), show="tree headings", height=14)
+        self.tree.heading("#0", text="节目")
+        self.tree.heading("date", text="日期")
+        self.tree.column("#0", width=460)
+        self.tree.column("date", width=110)
         self.tree.pack(fill="both", expand=True, padx=14, pady=(0, 7))
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-1>", lambda e: self._open_subtitles())
@@ -851,25 +926,36 @@ class HomeTab:
         self.open_subtitles_btn.pack(side="left")
         self.open_audio_btn = ttk.Button(btn_row, text="播放音频", command=self._open_audio, state="disabled")
         self.open_audio_btn.pack(side="left", padx=(8, 0))
+        self.open_srt_btn = ttk.Button(btn_row, text="打开SRT字幕", command=self._open_srt, state="disabled")
+        self.open_srt_btn.pack(side="left", padx=(8, 0))
+        self.open_vtt_btn = ttk.Button(btn_row, text="打开VTT字幕", command=self._open_vtt, state="disabled")
+        self.open_vtt_btn.pack(side="left", padx=(8, 0))
         self.open_folder_btn = ttk.Button(btn_row, text="打开所在文件夹", command=self._open_folder, state="disabled")
         self.open_folder_btn.pack(side="left", padx=(8, 0))
 
         self.status_label = ttk.Label(parent, text="", style="Muted.TLabel")
         self.status_label.pack(anchor="w", padx=14, pady=(0, 14))
 
-        self._node_paths = {}  # tree节点id -> 期数文件夹绝对路径（只有期数这一级节点才有）
+        self._node_paths = {}  # tree节点id -> 期数文件夹绝对路径（只有期数这一级子节点才有，
+                                # 节目名那一级父节点不在这里面，选中父节点时按钮全部禁用）
         self.refresh()
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         self._node_paths.clear()
-        episodes = scan_episodes()  # 已经按 节目名→期数标题 排好序
+        episodes = scan_episodes()  # 已经按 节目名→日期新到旧 分组排好序
 
-        shows = set()
-        for show_name, ep_title, ep_path in episodes:
-            shows.add(show_name)
-            node = self.tree.insert("", "end", values=(show_name, ep_title))
-            self._node_paths[node] = ep_path
+        shows = {}  # 节目名 -> 这个节目在tree里的父节点id
+        for show_name, ep_title, ep_path, display_date in episodes:
+            if show_name not in shows:
+                shows[show_name] = self.tree.insert("", "end", text=show_name, open=True)
+            ep_node = self.tree.insert(shows[show_name], "end", text=ep_title, values=(display_date,))
+            self._node_paths[ep_node] = ep_path
+
+        # 父节点标题后面补上这个节目有几期，等tree都插完、数量确定了再统一回填
+        for show_name, show_node in shows.items():
+            count = len(self.tree.get_children(show_node))
+            self.tree.item(show_node, text=f"{show_name}（{count}期）")
 
         if not episodes:
             self.status_label.config(text="还没有生成任何一期——跑一次 daily_podcast.py 之后回来刷新看看")
@@ -877,6 +963,7 @@ class HomeTab:
             self.status_label.config(text=f"共 {len(shows)} 个节目、{len(episodes)} 期")
 
         self._update_buttons_state()
+        self.parent.scroll_to_top()
 
     def _selected_episode_path(self):
         sel = self.tree.selection()
@@ -891,8 +978,12 @@ class HomeTab:
         path = self._selected_episode_path()
         has_subtitles = bool(path) and os.path.exists(os.path.join(path, "subtitles.html"))
         has_audio = bool(path) and os.path.exists(os.path.join(path, "audio.mp3"))
+        has_srt = bool(path) and os.path.exists(os.path.join(path, "subtitles.srt"))
+        has_vtt = bool(path) and os.path.exists(os.path.join(path, "subtitles.vtt"))
         self.open_subtitles_btn.config(state="normal" if has_subtitles else "disabled")
         self.open_audio_btn.config(state="normal" if has_audio else "disabled")
+        self.open_srt_btn.config(state="normal" if has_srt else "disabled")
+        self.open_vtt_btn.config(state="normal" if has_vtt else "disabled")
         self.open_folder_btn.config(state="normal" if path else "disabled")
 
     def _open_subtitles(self):
@@ -908,6 +999,22 @@ class HomeTab:
         if not path:
             return
         target = os.path.join(path, "audio.mp3")
+        if os.path.exists(target):
+            os.startfile(target)
+
+    def _open_srt(self):
+        path = self._selected_episode_path()
+        if not path:
+            return
+        target = os.path.join(path, "subtitles.srt")
+        if os.path.exists(target):
+            os.startfile(target)
+
+    def _open_vtt(self):
+        path = self._selected_episode_path()
+        if not path:
+            return
+        target = os.path.join(path, "subtitles.vtt")
         if os.path.exists(target):
             os.startfile(target)
 
@@ -934,6 +1041,44 @@ def sanitize_filename(title):
     """跟daily_podcast.py里的同名函数逻辑一致——就是这么短，直接抄一份，不为这一个函数去
     导入整个daily_podcast.py（那样会把它的faster-whisper等重量级依赖也带进GUI进程）"""
     return re.sub(r'[\\/*?:"<>|]', "", title)[:80]
+
+
+def resolve_apple_podcasts_feed(url):
+    """跟daily_podcast.py里的同名函数逻辑一致，同样的理由直接抄一份而不是导入。
+    苹果播客链接（podcasts.apple.com/.../idNNNNNN）通过苹果公开的iTunes Lookup API
+    查出真正的RSS地址；不是苹果链接就原样返回。"""
+    match = re.search(r"podcasts\.apple\.com/[^\s]*?/id(\d+)", url)
+    if not match:
+        return url
+    podcast_id = match.group(1)
+    resp = requests.get(f"https://itunes.apple.com/lookup?id={podcast_id}", timeout=15, headers=RSS_HEADERS)
+    resp.raise_for_status()
+    results = resp.json().get("results") or []
+    if not results or not results[0].get("feedUrl"):
+        raise ValueError("这个苹果播客ID没有查到对应的RSS地址（可能不是播客节目，或者苹果没公开这个字段）")
+    return results[0]["feedUrl"]
+
+
+def resolve_apple_episode_guid(url):
+    """如果链接里带着?i=数字（苹果链接指到具体某一期，不只是节目主页），查出这一期在
+    RSS里对应的<guid>，方便调用方从拉取到的列表里精确定位到这一期。查不到（比如太老的
+    单集，苹果这个episode查询接口最多只给最近200条）就返回None，调用方按"没定位到具体
+    某一期，就当成拉取整档节目"处理，不报错、不中断。"""
+    show_match = re.search(r"podcasts\.apple\.com/[^\s?]*?/id(\d+)", url)
+    episode_match = re.search(r"[?&]i=(\d+)", url)
+    if not show_match or not episode_match:
+        return None
+    show_id = show_match.group(1)
+    episode_id = int(episode_match.group(1))
+    resp = requests.get(
+        f"https://itunes.apple.com/lookup?id={show_id}&entity=podcastEpisode&limit=200",
+        timeout=15, headers=RSS_HEADERS,
+    )
+    resp.raise_for_status()
+    for item in resp.json().get("results") or []:
+        if item.get("trackId") == episode_id:
+            return item.get("episodeGuid")
+    return None
 
 
 def find_python_exe(prefer_config=True):
@@ -1017,11 +1162,12 @@ class BatchJob:
     """一项待处理的任务：一个音频（不管来自本地文件、RSS下载还是zip压缩包）要归到哪个节目、
     起什么标题。source_type是"local"/"download"/"zip"之一，source是对应的路径/URL/(zip路径,条目名)"""
 
-    def __init__(self, show_name, episode_title, source_type, source):
+    def __init__(self, show_name, episode_title, source_type, source, published=""):
         self.show_name = show_name
         self.episode_title = episode_title
         self.source_type = source_type
         self.source = source
+        self.published = published  # 只有RSS历史下载场景才有，本地文件/zip没有这个概念
         self.status = "排队中"
         self.error = None
         self.result_dir = None
@@ -1084,10 +1230,14 @@ def _process_one_job(python_exe, job, on_stage):
     else:
         source_arg = job.source
 
+    # config.json里存的就是"auto"/"en"/"zh"这个原始value（下拉框label<->value的转换在
+    # SettingsTab保存时就做完了），这里直接读，不用再转一次
+    language = load_existing_config().get("language", "auto")
     args = [
         python_exe, DAILY_PODCAST_PATH, "--manual-job",
         "--show", job.show_name, "--title", job.episode_title,
         "--source-type", job.source_type, "--source", source_arg,
+        "--published", job.published, "--language", language,
     ]
     env = build_subprocess_env(python_exe)
     proc = subprocess.Popen(
@@ -1256,6 +1406,15 @@ class SingleFilePane:
         self.file_label = ttk.Label(file_row, text="未选择文件", style="Muted.TLabel")
         self.file_label.pack(side="left", padx=(10, 0))
 
+        # 本地文件和视频链接二选一：填了链接就用链接（走yt-dlp解析下载音频），没填链接
+        # 才看有没有选本地文件。两个都填的话优先链接——因为链接这栏是后加的，选文件那个
+        # 按钮更显眼，用户更可能是先点了选文件、后来想起来其实是要粘链接又忘了清空
+        url_row = ttk.Frame(parent)
+        url_row.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(url_row, text="或者粘贴视频链接（YouTube/B站）").pack(side="left")
+        self.video_url_var = tk.StringVar()
+        ttk.Entry(url_row, textvariable=self.video_url_var, width=40).pack(side="left", padx=(6, 0))
+
         form = ttk.Frame(parent)
         form.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Label(form, text="节目名").grid(row=0, column=0, sticky="w", pady=3)
@@ -1282,6 +1441,8 @@ class SingleFilePane:
             parent, style="Muted.TLabel", wraplength=680, justify="left",
             text=(
                 "节目名如果跟已有的一样，会归到同一个节目下面；不一样就会新建一个。\n"
+                "视频链接支持yt-dlp能解析的网站（YouTube、B站等），只下音频不下视频。"
+                "YouTube这边经常会被识别成「机器人」拦掉，不稳定，B站相对稳一些。\n"
                 "提示：如果是用打包好的独立exe运行，这个功能需要电脑上有CUDA运行环境才能跑GPU转录；"
                 "更省心的做法是用 python setup_wizard.py 在项目自带的conda环境里运行。"
             ),
@@ -1301,8 +1462,13 @@ class SingleFilePane:
         self.file_label.config(text=os.path.basename(path), style="TLabel")
 
     def _start(self):
-        if not self.audio_path:
-            messagebox.showerror("错误", "请先选择音频文件")
+        video_url = self.video_url_var.get().strip()
+        if video_url:
+            source_type, source = "ytdlp", video_url
+        elif self.audio_path:
+            source_type, source = "local", self.audio_path
+        else:
+            messagebox.showerror("错误", "请先选择音频文件，或者粘贴一个视频链接")
             return
         show_name = self.show_var.get().strip()
         title = self.title_var.get().strip()
@@ -1310,7 +1476,7 @@ class SingleFilePane:
             messagebox.showerror("错误", "节目名和期数标题都要填")
             return
 
-        jobs = [BatchJob(show_name, title, "local", self.audio_path)]
+        jobs = [BatchJob(show_name, title, source_type, source)]
         jobs = confirm_and_filter_conflicts(jobs)
         if not jobs:
             return
@@ -1357,15 +1523,19 @@ class RssHistoryPane:
     def __init__(self, parent):
         self.parent = parent
         self.state = BatchState()
-        self.entries = []  # [(tree节点id, 标题, 音频URL)]
+        self.entries = []  # [(tree节点id, 标题, 音频URL, 发布时间)]
 
+        # 节目名跟「单个文件」页签同一套逻辑：一个Combobox身兼两职——下拉选已有的会
+        # 顺带把RSS地址自动填上（这里才有的额外行为，因为这里确实需要一个RSS地址才能
+        # 拉取列表）；也可以直接敲一个还没配置过的新节目名，这时候RSS地址就自己填/粘贴。
+        # 不再跟"下载后归到节目名"分成两个各管一段的字段，选的/敲的就是最终要用的节目名。
         top = ttk.Frame(parent)
         top.pack(fill="x", padx=10, pady=(14, 6))
-        ttk.Label(top, text="已配置节目").pack(side="left")
-        self.known_show_var = tk.StringVar()
-        self.known_show_combo = ttk.Combobox(top, textvariable=self.known_show_var, width=14, state="readonly")
-        self.known_show_combo.pack(side="left", padx=(4, 12))
-        self.known_show_combo.bind("<<ComboboxSelected>>", self._on_known_show_selected)
+        ttk.Label(top, text="节目名").pack(side="left")
+        self.show_var = tk.StringVar()
+        self.show_combo = ttk.Combobox(top, textvariable=self.show_var, width=14)
+        self.show_combo.pack(side="left", padx=(4, 12))
+        self.show_combo.bind("<<ComboboxSelected>>", self._on_show_selected)
 
         ttk.Label(top, text="RSS地址").pack(side="left")
         self.rss_url_var = tk.StringVar()
@@ -1374,14 +1544,29 @@ class RssHistoryPane:
         self.fetch_btn.pack(side="left")
         self._fetch_state = None
 
+        # 拉出来的历史动辄上千期（实测过intelligence这个feed有1977期），光靠滚动翻不现实，
+        # 加个搜索框按标题过滤——用detach/reattach而不是删掉重插，这样勾选状态不会因为
+        # 搜索字符串变化就丢失（用户可能搜一下勾几个、再搜别的关键词接着勾）
+        search_row = ttk.Frame(parent)
+        search_row.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(search_row, text="搜索标题").pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", self._apply_filter)
+        ttk.Entry(search_row, textvariable=self.search_var, width=40).pack(side="left", padx=(4, 0))
+
+        tree_row = ttk.Frame(parent)
+        tree_row.pack(fill="both", expand=True, padx=10, pady=(0, 6))
         self.tree = ttk.Treeview(
-            parent, columns=("date",), show="tree headings", height=9, selectmode="extended",
+            tree_row, columns=("date",), show="tree headings", height=9, selectmode="extended",
         )
         self.tree.heading("#0", text="标题")
         self.tree.heading("date", text="发布时间")
-        self.tree.column("#0", width=440)
-        self.tree.column("date", width=180)
-        self.tree.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        self.tree.column("#0", width=420)
+        self.tree.column("date", width=170)
+        self.tree.pack(side="left", fill="both", expand=True)
+        tree_scroll = ttk.Scrollbar(tree_row, orient="vertical", command=self.tree.yview)
+        tree_scroll.pack(side="left", fill="y")
+        self.tree.configure(yscrollcommand=tree_scroll.set)
 
         sel_row = ttk.Frame(parent)
         sel_row.pack(fill="x", padx=10, pady=(0, 8))
@@ -1389,12 +1574,6 @@ class RssHistoryPane:
         ttk.Button(sel_row, text="取消全选", command=lambda: self.tree.selection_remove(*self.tree.get_children())).pack(side="left", padx=(6, 0))
         self.fetch_status_label = ttk.Label(sel_row, text="", style="Muted.TLabel")
         self.fetch_status_label.pack(side="left", padx=(10, 0))
-
-        target_row = ttk.Frame(parent)
-        target_row.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Label(target_row, text="下载后归到节目名").pack(side="left")
-        self.target_show_var = tk.StringVar()
-        ttk.Combobox(target_row, textvariable=self.target_show_var, width=20).pack(side="left", padx=(6, 0))
 
         self.start_btn = ttk.Button(parent, text="下载并处理选中项", style="Accent.TButton", command=self._start)
         self.start_btn.pack(anchor="w", padx=10, pady=(0, 8))
@@ -1412,18 +1591,31 @@ class RssHistoryPane:
     def refresh_show_choices(self):
         config = load_existing_config()
         shows = list(config.get("feeds", {}).keys())
-        self.known_show_combo["values"] = shows
+        self.show_combo["values"] = shows
 
-    def _on_known_show_selected(self, _event=None):
-        show = self.known_show_var.get()
+    def _on_show_selected(self, _event=None):
+        """下拉选了一个已配置节目——顺手把它的RSS地址也自动填上，省得再去设置页签抄一遍。
+        如果这个节目在config.json里没存RSS地址（比如手动处理时随手起的名字），就什么都不填，
+        用户自己粘贴，不强行清空已经填好的内容"""
+        show = self.show_var.get()
         config = load_existing_config()
         url = config.get("feeds", {}).get(show)
         if url:
             self.rss_url_var.set(url)
-        self.target_show_var.set(show)
 
     def _select_all(self):
         self.tree.selection_set(self.tree.get_children())
+
+    def _apply_filter(self, *_args):
+        """按标题过滤显示——detach不匹配的，重新attach匹配的，不是删了重插，
+        已经勾选的项目哪怕暂时被搜索词过滤掉了，勾选状态也还留着，回头清空搜索词
+        还能看到之前勾的还在。"""
+        query = self.search_var.get().strip().lower()
+        for node, title, _url, _pub in self.entries:
+            if not query or query in title.lower():
+                self.tree.move(node, "", "end")
+            else:
+                self.tree.detach(node)
 
     def _fetch(self):
         url = self.rss_url_var.get().strip()
@@ -1437,15 +1629,21 @@ class RssHistoryPane:
         self.fetch_btn.config(state="disabled")
         self.fetch_status_label.config(text="拉取中...", style="Muted.TLabel")
 
-        state = {"done": False, "error": None, "entries": None}
+        state = {"done": False, "error": None, "entries": None, "target_guid": None}
         self._fetch_state = state
 
         def worker():
             try:
+                # 先看一眼是不是苹果播客链接，是的话换成它背后真正的RSS地址；
+                # 不是苹果链接resolve_apple_podcasts_feed会原样把url传回来，不影响原逻辑
+                real_url = resolve_apple_podcasts_feed(url)
+                # 如果链接还带着?i=（指向具体某一期而不只是节目主页），顺便查一下这一期
+                # 对应的RSS guid，等下把entries插进tree之后可以直接选中它，不用用户自己找
+                state["target_guid"] = resolve_apple_episode_guid(url)
                 # 跟daily_podcast.py的get_all_episodes同样的抓取方式（自己带超时，不让
                 # feedparser直接拿URL），这里直接内联一遍而不是导入daily_podcast.py，
                 # 避免GUI进程被迫加载它那些转录/翻译相关的重量级依赖
-                r = requests.get(url, timeout=30, headers=RSS_HEADERS)
+                r = requests.get(real_url, timeout=30, headers=RSS_HEADERS)
                 r.raise_for_status()
                 state["entries"] = feedparser.parse(r.content).entries
             except Exception as e:
@@ -1470,7 +1668,9 @@ class RssHistoryPane:
             return
 
         self.tree.delete(*self.tree.get_children())
+        self.search_var.set("")  # 换了一批新拉取的entries，之前搜索框里残留的关键词清掉
         self.entries = []
+        target_node = None
         for entry in state["entries"]:
             enclosures = entry.get("enclosures") or []
             if not enclosures:
@@ -1478,17 +1678,27 @@ class RssHistoryPane:
             audio_url = enclosures[0].href
             pub = entry.get("published", "")
             node = self.tree.insert("", "end", text=entry.get("title", "（无标题）"), values=(pub,))
-            self.entries.append((node, entry.get("title", "（无标题）"), audio_url))
+            self.entries.append((node, entry.get("title", "（无标题）"), audio_url, pub))
+            if state["target_guid"] and entry.get("id") == state["target_guid"]:
+                target_node = node
 
         if not self.entries:
             self.fetch_status_label.config(text="没有找到带音频链接的条目", style="Warning.TLabel")
+        elif target_node:
+            # 链接里指定了具体某一期，而且在列表里精确定位到了——直接选中+滚动过去，
+            # 不用用户自己从几百上千期里去找
+            self.tree.selection_set(target_node)
+            self.tree.see(target_node)
+            self.fetch_status_label.config(
+                text=f"共 {len(self.entries)} 期，已定位到链接指定的那一期", style="Success.TLabel",
+            )
         else:
             self.fetch_status_label.config(text=f"共 {len(self.entries)} 期", style="Muted.TLabel")
 
     def _start(self):
-        target_show = self.target_show_var.get().strip()
+        target_show = self.show_var.get().strip()
         if not target_show:
-            messagebox.showerror("错误", "请填写下载后归到哪个节目名")
+            messagebox.showerror("错误", "请先填节目名（下拉选一个已有的，或者直接敲一个新的）")
             return
         selected_ids = set(self.tree.selection())
         if not selected_ids:
@@ -1496,8 +1706,8 @@ class RssHistoryPane:
             return
 
         jobs = [
-            BatchJob(target_show, title, "download", url)
-            for node, title, url in self.entries
+            BatchJob(target_show, title, "download", url, published=pub)
+            for node, title, url, pub in self.entries
             if node in selected_ids
         ]
         jobs = confirm_and_filter_conflicts(jobs)
@@ -1542,7 +1752,8 @@ class LocalBatchPane:
         target_row.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Label(target_row, text="归到节目名").pack(side="left")
         self.target_show_var = tk.StringVar()
-        ttk.Combobox(target_row, textvariable=self.target_show_var, width=20).pack(side="left", padx=(6, 0))
+        self.show_combo = ttk.Combobox(target_row, textvariable=self.target_show_var, width=20)
+        self.show_combo.pack(side="left", padx=(6, 0))
 
         self.start_btn = ttk.Button(parent, text="批量转录+翻译选中项", style="Accent.TButton", command=self._start)
         self.start_btn.pack(anchor="w", padx=10, pady=(0, 8))
@@ -1558,7 +1769,11 @@ class LocalBatchPane:
         self.refresh_show_choices()
 
     def refresh_show_choices(self):
-        pass  # target_show是Entry风格的Combobox，不需要每次都重新拉取列表，_start前用户自己填/选
+        # 跟「单个文件」页签同一套逻辑：下拉能看到已有节目，也可以直接敲一个新的——
+        # 之前这里是空实现，Combobox的下拉列表一直是空的，只能打字，看不到已有选项，
+        # 跟另外两个页签不一致
+        config = load_existing_config()
+        self.show_combo["values"] = list(config.get("feeds", {}).keys())
 
     def _pick_folder(self):
         folder = filedialog.askdirectory(title="选择包含音频文件的文件夹")

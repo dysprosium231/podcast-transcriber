@@ -4,6 +4,7 @@
   },
   "whisper_model_size": "large-v3",
   "python_exe": "",
+  "language": "auto",
   "translation": {
     "provider_name": "DeepSeek",
     "base_url": "https://api.deepseek.com",
