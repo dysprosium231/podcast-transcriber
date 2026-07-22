@@ -1307,14 +1307,18 @@ def _emit_json(payload):
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-def run_manual_job(show_name, episode_title, source_type, source, published="", language="auto", engine="whisper",
+def run_manual_job(show_name, episode_title, source_type, source, published="", language=None, engine=None,
                     enable_diarization=None):
     """手动任务模式的核心逻辑：不检查RSS、不循环多个节目，只处理指定的这一个音频。
     被 setup_wizard.py 当独立子进程调用——这样GUI本身不需要打包faster-whisper/ctranslate2这些
     体积巨大的转录依赖，也不用操心CUDA运行库有没有被打包进exe，因为跑的就是真实python环境。
     source_type: "local"（本地文件路径）/ "download"（音频URL）/ "zip"（"zip路径::压缩包内条目名"）
     published: 可选，RSS历史下载场景下这一期原本的发布时间（GUI那边已经从RSS条目里读到了，
-    传过来存进meta.json）；本地文件/zip没有这个概念，留空，播客库改用处理时刻排序"""
+    传过来存进meta.json）；本地文件/zip没有这个概念，留空，播客库改用处理时刻排序
+    language/engine/enable_diarization留空（None）就用config.json里的全局默认值，跟GUI手动处理
+    面板的行为一致；显式传值（比如CLI里带了--language/--engine）才会覆盖config.json"""
+    language = LANGUAGE if language is None else language
+    engine = TRANSCRIBE_ENGINE if engine is None else engine
     show_dir = os.path.join(EPISODES_DIR, show_name)
     os.makedirs(show_dir, exist_ok=True)
     safe_title = sanitize_filename(episode_title)
@@ -1421,8 +1425,8 @@ if __name__ == "__main__":
         parser.add_argument("--source-type", required=True, choices=["local", "download", "zip", "ytdlp"])
         parser.add_argument("--source", required=True)
         parser.add_argument("--published", default="")
-        parser.add_argument("--language", default="auto", choices=["auto", "en", "zh"])
-        parser.add_argument("--engine", default="whisper", choices=["whisper", "sensevoice"])
+        parser.add_argument("--language", default=None, choices=["auto", "en", "zh"])
+        parser.add_argument("--engine", default=None, choices=["whisper", "sensevoice"])
         parser.add_argument("--enable-diarization", dest="enable_diarization", action="store_true", default=None)
         parser.add_argument("--no-diarization", dest="enable_diarization", action="store_false")
         cli_args = parser.parse_args()
