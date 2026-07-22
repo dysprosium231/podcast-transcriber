@@ -5,7 +5,11 @@
 :: (Kept ASCII-only on purpose: non-ASCII bytes in this file were found to corrupt
 :: variable parsing intermittently when this script is launched by Windows Task
 :: Scheduler, though not when run interactively -- see git history for details.)
-set CONDA_ENV=D:\condaenvs\whisper-conda
+:: The line below is a placeholder, not a real path -- setup_wizard.py rewrites it
+:: automatically the first time you set a Python interpreter in Settings and click
+:: Save. Don't commit your own real path back here; this file stays tracked in git
+:: and a machine-specific path doesn't belong in the public repo.
+set CONDA_ENV=C:\Users\YourName\miniconda3\envs\whisper-env
 set PATH=%CONDA_ENV%;%CONDA_ENV%\Library\mingw-w64\bin;%CONDA_ENV%\Library\usr\bin;%CONDA_ENV%\Library\bin;%CONDA_ENV%\Scripts;%CONDA_ENV%\bin;%PATH%
 
 cd /d %~dp0

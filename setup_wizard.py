@@ -1758,10 +1758,11 @@ class BatchProgressWidget:
 
         self.status_tree = ttk.Treeview(frame, columns=("status",), show="tree headings", height=7)
         self.status_tree.heading("#0", text="标题")
-        self.status_tree.heading("status", text="状态")
+        self.status_tree.heading("status", text="状态（失败的双击这一行看详细原因）")
         self.status_tree.column("#0", width=420)
-        self.status_tree.column("status", width=160)
+        self.status_tree.column("status", width=280)
         self.status_tree.pack(fill="both", expand=True, padx=10, pady=(6, 4))
+        self.status_tree.bind("<Double-1>", self._on_row_double_click)
 
         self.progress_bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
         self.progress_bar.pack(fill="x", padx=10, pady=(0, 4))
@@ -1774,6 +1775,8 @@ class BatchProgressWidget:
         self.overall_label.pack(side="left", padx=(10, 0))
 
         self._job_nodes = {}
+        self._jobs_by_node = {}  # 双击某一行时用来反查对应的job拿job.error，_job_nodes是反方向
+                                  # （job找node），这里额外存一份方便处理点击事件
         self._state = None
         self._on_all_done = None
 
@@ -1782,12 +1785,22 @@ class BatchProgressWidget:
         self._on_all_done = on_all_done
         self.status_tree.delete(*self.status_tree.get_children())
         self._job_nodes = {}
+        self._jobs_by_node = {}
         for job in jobs:
             node = self.status_tree.insert("", "end", text=f"「{job.show_name}」{job.episode_title}", values=(job.status,))
             self._job_nodes[id(job)] = node
+            self._jobs_by_node[node] = job
         self.cancel_btn.config(state="normal")
         self.overall_label.config(text=f"共 {len(jobs)} 项", style="Muted.TLabel")
         self._poll()
+
+    def _on_row_double_click(self, _event=None):
+        sel = self.status_tree.selection()
+        if not sel:
+            return
+        job = self._jobs_by_node.get(sel[0])
+        if job and job.status == "失败" and job.error:
+            messagebox.showerror(f"「{job.show_name}」{job.episode_title} 处理失败", job.error)
 
     def _cancel(self):
         if self._state:
@@ -1799,7 +1812,12 @@ class BatchProgressWidget:
         for job in state.jobs:
             node = self._job_nodes.get(id(job))
             if node:
-                self.status_tree.item(node, values=(job.status,))
+                # 失败的话在状态后面直接带一截错误信息，不用非得双击才知道大概是什么问题；
+                # 单行显示放不下的长错误还是得双击看messagebox里的完整内容
+                status_text = job.status
+                if job.status == "失败" and job.error:
+                    status_text = f"失败：{job.error}"
+                self.status_tree.item(node, values=(status_text,))
         self.progress_bar["value"] = state.item_progress * 100
         if state.done:
             done_count = sum(1 for j in state.jobs if j.status == "完成")
