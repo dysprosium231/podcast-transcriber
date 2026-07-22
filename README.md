@@ -136,7 +136,7 @@ python setup_wizard.py
 
 **批量转录学习材料**：去「手动处理」页签——
 
-- 「单个文件」：选一个本地音频文件、或者粘贴一个视频链接（YouTube/B站，靠 [yt-dlp](https://github.com/yt-dlp/yt-dlp) 解析下载音频），填个节目名和标题，点「开始转录+翻译」。YouTube 这边经常会被识别成「机器人」拦掉，不稳定，B站相对稳一些
+- 「单个文件」：选一个本地音频文件、或者粘贴一个视频链接（YouTube/B站，靠 [yt-dlp](https://github.com/yt-dlp/yt-dlp) 解析下载音频）。节目名/期数标题留空的话会自动读文件名/视频标题、按来源站点填默认节目名，不用每次手动打。点「开始转录+翻译」。YouTube 这边经常会被识别成「机器人」拦掉，不稳定，B站相对稳一些——「设置」页可以选一个浏览器，下载时带上那个浏览器里已登录的YouTube cookies，能缓解这个问题（不保证100%有效，要求那个浏览器当时确实登录着YouTube）
 - 「批量本地导入」：选一个装了一堆音频的文件夹（或者一个 zip 压缩包），勾选要处理的文件，一次性排队批量转录+翻译
 - 「RSS历史下载」：粘贴播客的 RSS 地址（也支持 Apple Podcasts 链接，整档或者指向某一期的链接都行），把整个历史列表拉出来，勾选任意几期批量下载处理，不受限于"只能拿到最新一期"
 
@@ -169,6 +169,8 @@ python setup_wizard.py
   "language": "auto",                 // "auto"/"en"/"zh"，只支持这两种语言+自动识别
   "enable_diarization": false,        // 是否启用说话人区分
   "diarization_num_speakers": -1,     // 说话人数量，-1表示自动判断
+  "ytdlp_cookies_browser": "",         // 可选："chrome"/"edge"/"firefox"，下载YouTube/B站链接时
+                                      // 带上这个浏览器里已登录的cookies，缓解YouTube机器人拦截
   "python_exe": "",                  // 可选：手动处理/计划任务用来跑转录/翻译的真实python.exe路径，
                                       // 留空会自动探测；保存配置时也会同步写进 run_daily.bat
   "translation": {
