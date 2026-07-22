@@ -893,7 +893,7 @@ class SetupWizard:
         toggle_row.pack(fill="x", padx=10, pady=(10, 0))
         self.diarization_enabled_var = tk.BooleanVar(value=False)
         make_checkmark_toggle(toggle_row, "启用说话人区分", self.diarization_enabled_var).pack(side="left")
-        ttk.Label(toggle_row, text="说话人数量（留空=自动判断）").pack(side="left", padx=(20, 4))
+        ttk.Label(toggle_row, text="说话人数量（强烈建议填，知道几个人就填几）").pack(side="left", padx=(20, 4))
         self.diarization_num_speakers_var = tk.StringVar(value="")
         ttk.Entry(toggle_row, textvariable=self.diarization_num_speakers_var, width=6).pack(side="left")
 
@@ -902,8 +902,14 @@ class SetupWizard:
             text="跟Whisper/SenseVoice哪个引擎都能配合，是转录完之后单独对同一段音频再跑一遍分析，"
                  "给每句话加一个「说话人N」标签，不会改动已经生成的时间戳，字幕同步不受影响。真的有"
                  "两人同时说话（抢话/插话）的话，那一句会标成「说话人1、说话人2」这样，不会强行"
-                 "只认一个人。准确率不是100%——声音相似的时候容易分错，多人辩论类节目要有心理准备。\n"
-                 "会额外增加一段处理时间，纯CPU跑，实测一集48分钟的播客大概要7-8分钟（4线程），"
+                 "只认一个人。\n"
+                 "「说话人数量」留空=自动判断，但实测这条路准确率上限不高——拿一集双人播客实测，"
+                 "自动判断把同一个人拆成了十几到几十个不同的人，调参数也压不下去；同一集音频改成"
+                 "明确填「2」，直接精确聚成2个人，准确率完全是两个量级。知道确切人数（很多播客"
+                 "本来就是固定几个主播）的话务必填在这里，不要指望自动判断，尤其别用自动判断的"
+                 "结果去评价这个功能好不好用。声音相似的时候还是容易分错，多人辩论类节目要有心理"
+                 "准备。\n"
+                 "会额外增加一段处理时间，纯CPU跑，实测一集25分钟的播客大概要3分钟（4线程），"
                  "音频越长这一步花的时间也越长，默认关闭。",
         ).pack(anchor="w", padx=10, pady=(6, 10))
 

@@ -1066,7 +1066,15 @@ def _load_diarization_model():
             num_threads=4,
         ),
         embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=DIARIZATION_EMBEDDING_FILE, num_threads=4),
-        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=DIARIZATION_NUM_SPEAKERS, threshold=0.5),
+        # threshold=0.5（sherpa-onnx的默认值）在真实长音频上严重失控：拿一集25分钟的双人播客
+        # 实测扫过0.5/0.7/0.8/0.9/1.0整个区间，"说话人"数量是57/34/29/20/15——同一个人的不同
+        # 片段被拆成几十个不同的人，而且哪怕把threshold开到API允许的上限1.0，还是收敛不到
+        # 播客实际的2个人。也就是说：不知道确切说话人数量时，靠threshold自动判断这条路本身
+        # 就有明显上限，不是随便调个数字就能修好的，这里选一个稍微不那么离谱的默认值，但
+        # 治标不治本。真正可靠的解法是DIARIZATION_NUM_SPEAKERS不留空——同一集音频直接指定
+        # num_clusters=2实测精确聚成2个说话人，跟threshold那条路完全不是一个量级的准确率。
+        # 设置页因此改成更明确建议"知道确切人数就填，别指望自动判断"
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=DIARIZATION_NUM_SPEAKERS, threshold=1.0),
         min_duration_on=0.3,
         min_duration_off=0.5,
     )
