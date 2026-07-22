@@ -557,13 +557,51 @@ def start_model_download(size, state):
                         outer_state.progress = self.n / self.total
                     outer_state.desc = self.desc or "下载中"
 
+            # 实测HF镜像偶尔会在个别文件上一直卡在HEAD请求这一步（snapshot_download内部靠HEAD
+            # 判断文件是否存在），跟SenseVoice模型下载遇到的是同一个问题——重试snapshot_download
+            # 本身没用，得先拿到repo里真实的文件清单，再对下载完还缺的文件直接GET兜底，绕开HEAD
+            repo_id = f"Systran/faster-whisper-{size}"
             target_dir = os.path.join(MODELS_DIR, size)
             os.makedirs(target_dir, exist_ok=True)
-            snapshot_download(
-                repo_id=f"Systran/faster-whisper-{size}",
-                local_dir=target_dir,
-                tqdm_class=ProgressTqdm,
-            )
+
+            from huggingface_hub import HfApi
+            try:
+                all_files = [f for f in HfApi().list_repo_files(repo_id) if f != ".gitattributes"]
+            except Exception:
+                all_files = None  # 拿不到清单的话没法校验/兜底，只能指望snapshot_download自己成功
+
+            last_error = None
+            for _attempt in range(4):
+                try:
+                    snapshot_download(repo_id=repo_id, local_dir=target_dir, tqdm_class=ProgressTqdm)
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                if not all_files:
+                    continue
+                if not [f for f in all_files if not os.path.exists(os.path.join(target_dir, f))]:
+                    last_error = None
+                    break
+
+            missing = [f for f in all_files if not os.path.exists(os.path.join(target_dir, f))] if all_files else []
+            if missing:
+                for filename in missing:
+                    url = f"{os.environ['HF_ENDPOINT']}/{repo_id}/resolve/main/{filename}"
+                    resp = requests.get(url, stream=True, timeout=60)
+                    resp.raise_for_status()
+                    dest_path = os.path.join(target_dir, filename)
+                    os.makedirs(os.path.dirname(dest_path) or target_dir, exist_ok=True)
+                    with open(dest_path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                missing = [f for f in all_files if not os.path.exists(os.path.join(target_dir, f))]
+
+            if missing:
+                raise RuntimeError(f"以下模型文件始终下载不全，请稍后重试：{missing}")
+            if last_error and not all_files:
+                raise last_error
+
             state.progress = 1.0
             state.done = True
         except Exception as e:

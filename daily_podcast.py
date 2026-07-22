@@ -906,9 +906,52 @@ def _check_show(show_name, rss_url, latest_log):
     }
 
 
+def _ensure_whisper_model_downloaded():
+    """本地没有模型文件的话，WhisperModel(...)构造时会交给faster-whisper自己内部去下载——
+    但那条路径没有重试/兜底，实测HF镜像偶尔在个别文件上卡住会直接导致整个加载失败。这里在
+    构造WhisperModel之前先用跟设置页「下载此模型」同一套重试+直接GET兜底的逻辑保证下载完整，
+    不依赖faster-whisper自己那条不够健壮的下载路径"""
+    if _LOCAL_MODEL_READY:
+        return
+    from huggingface_hub import HfApi, snapshot_download
+
+    repo_id = f"Systran/faster-whisper-{_WHISPER_MODEL_SIZE}"
+    os.makedirs(_LOCAL_MODEL_DIR, exist_ok=True)
+    try:
+        all_files = [f for f in HfApi().list_repo_files(repo_id) if f != ".gitattributes"]
+    except Exception:
+        all_files = None
+
+    last_error = None
+    for _attempt in range(4):
+        try:
+            snapshot_download(repo_id=repo_id, local_dir=_LOCAL_MODEL_DIR)
+            last_error = None
+        except Exception as e:
+            last_error = e
+        if all_files and not [f for f in all_files if not os.path.exists(os.path.join(_LOCAL_MODEL_DIR, f))]:
+            last_error = None
+            break
+
+    missing = [f for f in all_files if not os.path.exists(os.path.join(_LOCAL_MODEL_DIR, f))] if all_files else []
+    for filename in missing:
+        url = f"{os.environ['HF_ENDPOINT']}/{repo_id}/resolve/main/{filename}"
+        _download_file(url, os.path.join(_LOCAL_MODEL_DIR, filename))
+    missing = [f for f in all_files if not os.path.exists(os.path.join(_LOCAL_MODEL_DIR, f))] if all_files else []
+
+    if missing:
+        raise RuntimeError(f"以下Whisper模型文件始终下载不全，请稍后重试：{missing}")
+    if last_error and not all_files:
+        raise last_error
+
+
 def _load_model():
     """加载GPU模型，返回(model, batched_model)。跑在后台线程（配合spinner.run_with_work）。"""
-    model = WhisperModel(MODEL_PATH, device="cuda", compute_type="float16")
+    _ensure_whisper_model_downloaded()
+    # MODEL_PATH是模块导入时算好的，那时候本地可能还没有模型文件；下载可能是刚在上面这行
+    # 才发生的，不能沿用那个导入时就定死的旧值，得看现在_LOCAL_MODEL_DIR里是不是真的有了
+    model_path = _LOCAL_MODEL_DIR if os.path.exists(os.path.join(_LOCAL_MODEL_DIR, "model.bin")) else MODEL_PATH
+    model = WhisperModel(model_path, device="cuda", compute_type="float16")
     batched_model = BatchedInferencePipeline(model=model)
     return model, batched_model
 
