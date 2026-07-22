@@ -1051,10 +1051,22 @@ def download_diarization_model(on_progress=None):
         raise RuntimeError("说话人分离模型下载后校验未通过，请重试")
 
 
-def _load_diarization_model():
+# 自动判断模式（说话人数量留空）下的硬上限：真实测试中，一集25分钟的双人播客靠threshold
+# 自动判断，哪怕threshold开到API上限1.0，还是能拆出15个"说话人"，更极端的配置下测出过57个。
+# 这不是能靠调参根治的问题——长播客里穿插的广告、引语原声、客座嘉宾本来就是不同的真实
+# 人声，聚类算法把它们分开有它的道理，只是不符合"只有几个固定说话人"这个预期。这里加一道
+# 兜底：自动判断的结果一旦超过这个上限，就退化成固定聚类数重新跑一遍——不保证这个数字更
+# 准确，但至少不会再出现几十个说话人这种明显失控的结果
+MAX_AUTO_SPEAKERS = 8
+
+
+def _load_diarization_model(num_clusters_override=None):
     """加载说话人分离会话，跟_load_sensevoice_model()是并列的第三条模型加载路径，
-    纯CPU/ONNX，不依赖GPU"""
+    纯CPU/ONNX，不依赖GPU。num_clusters_override用于MAX_AUTO_SPEAKERS兜底重跑，
+    不传时用配置里的DIARIZATION_NUM_SPEAKERS"""
     import sherpa_onnx
+
+    num_clusters = DIARIZATION_NUM_SPEAKERS if num_clusters_override is None else num_clusters_override
 
     config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
         # 分割模型和embedding模型的num_threads各自默认是1（单线程！），实测一小时的播客
@@ -1074,7 +1086,7 @@ def _load_diarization_model():
         # 治标不治本。真正可靠的解法是DIARIZATION_NUM_SPEAKERS不留空——同一集音频直接指定
         # num_clusters=2实测精确聚成2个说话人，跟threshold那条路完全不是一个量级的准确率。
         # 设置页因此改成更明确建议"知道确切人数就填，别指望自动判断"
-        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=DIARIZATION_NUM_SPEAKERS, threshold=1.0),
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=num_clusters, threshold=1.0),
         min_duration_on=0.3,
         min_duration_off=0.5,
     )
@@ -1114,6 +1126,15 @@ def diarize_audio(sd, audio_path, on_progress=None):
         return 0
 
     result = sd.process(waveform, callback=_cb).sort_by_start_time()
+
+    # 自动判断模式下，结果超过MAX_AUTO_SPEAKERS就整段重跑一遍，改用固定聚类数兜底。
+    # 这里只在DIARIZATION_NUM_SPEAKERS本来就是-1（自动判断）时触发——用户已经手动指定
+    # 人数的话，不管结果是什么都不应该再被这道兜底逻辑覆盖
+    speaker_count = len(set(r.speaker for r in result))
+    if DIARIZATION_NUM_SPEAKERS == -1 and speaker_count > MAX_AUTO_SPEAKERS:
+        fallback_sd = _load_diarization_model(num_clusters_override=MAX_AUTO_SPEAKERS)
+        result = fallback_sd.process(waveform, callback=_cb).sort_by_start_time()
+
     return [(r.start, r.end, r.speaker) for r in result]
 
 

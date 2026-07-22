@@ -886,13 +886,13 @@ class SetupWizard:
 
     # ---------------- 说话人区分 ----------------
     def _build_diarization_section(self):
-        frame = ttk.LabelFrame(self.parent, text="说话人区分（可选，纯CPU，不影响时间戳/实时字幕）")
+        frame = ttk.LabelFrame(self.parent, text="说话人区分【实验性功能，默认关闭】（可选，纯CPU，不影响时间戳/实时字幕）")
         frame.pack(fill="x", padx=14, pady=7)
 
         toggle_row = ttk.Frame(frame)
         toggle_row.pack(fill="x", padx=10, pady=(10, 0))
         self.diarization_enabled_var = tk.BooleanVar(value=False)
-        make_checkmark_toggle(toggle_row, "启用说话人区分", self.diarization_enabled_var).pack(side="left")
+        make_checkmark_toggle(toggle_row, "启用说话人区分（实验性）", self.diarization_enabled_var).pack(side="left")
         ttk.Label(toggle_row, text="说话人数量（强烈建议填，知道几个人就填几）").pack(side="left", padx=(20, 4))
         self.diarization_num_speakers_var = tk.StringVar(value="")
         ttk.Entry(toggle_row, textvariable=self.diarization_num_speakers_var, width=6).pack(side="left")
@@ -909,6 +909,12 @@ class SetupWizard:
                  "本来就是固定几个主播）的话务必填在这里，不要指望自动判断，尤其别用自动判断的"
                  "结果去评价这个功能好不好用。声音相似的时候还是容易分错，多人辩论类节目要有心理"
                  "准备。\n"
+                 "标为「实验性」是因为深挖过后发现这不只是调参能解决的问题：新闻杂志类播客常常"
+                 "夹杂片头片尾广告、引语原声剪辑、客座嘉宾，这些本来就是不同的真实人声，识别成"
+                 "不同「说话人」并没有算法上的错误，只是不符合「全场只有固定几个主播」这个直觉"
+                 "预期——这种节目不存在一个能自动猜对的「总说话人数」。自动判断模式加了一道硬"
+                 "上限（超过8个说话人会自动退化重跑），保证不会再出现几十个说话人这种明显失控的"
+                 "结果，但这只是兜底，不代表结果就一定准。\n"
                  "会额外增加一段处理时间，纯CPU跑，实测一集25分钟的播客大概要3分钟（4线程），"
                  "音频越长这一步花的时间也越长，默认关闭。",
         ).pack(anchor="w", padx=10, pady=(6, 10))
