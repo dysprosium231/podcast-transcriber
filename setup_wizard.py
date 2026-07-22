@@ -833,9 +833,7 @@ class SetupWizard:
         toggle_row = ttk.Frame(frame)
         toggle_row.pack(fill="x", padx=10, pady=(10, 0))
         self.diarization_enabled_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            toggle_row, text="启用说话人区分", variable=self.diarization_enabled_var,
-        ).pack(side="left")
+        make_checkmark_toggle(toggle_row, "启用说话人区分", self.diarization_enabled_var).pack(side="left")
         ttk.Label(toggle_row, text="说话人数量（留空=自动判断）").pack(side="left", padx=(20, 4))
         self.diarization_num_speakers_var = tk.StringVar(value="")
         ttk.Entry(toggle_row, textvariable=self.diarization_num_speakers_var, width=6).pack(side="left")
@@ -1736,7 +1734,12 @@ class SingleFilePane:
         url_row.pack(fill="x", padx=10, pady=(0, 6))
         ttk.Label(url_row, text="或者粘贴视频链接（YouTube/B站）").pack(side="left")
         self.video_url_var = tk.StringVar()
-        ttk.Entry(url_row, textvariable=self.video_url_var, width=40).pack(side="left", padx=(6, 0))
+        url_entry = ttk.Entry(url_row, textvariable=self.video_url_var, width=40)
+        url_entry.pack(side="left", padx=(6, 0))
+        # 粘贴完链接、焦点移开的时候顺手去问一下视频标题，能省掉用户自己打一遍期数标题；
+        # 拿不到（链接错、被拦了）就静默放弃，不当错误处理——反正开始转录前还会正常校验
+        # 期数标题是否为空，拿不到标题的话用户自己填就行
+        url_entry.bind("<FocusOut>", lambda e: self._fetch_video_title_async())
 
         form = ttk.Frame(parent)
         form.pack(fill="x", padx=10, pady=(0, 8))
@@ -1783,6 +1786,30 @@ class SingleFilePane:
             return
         self.audio_path = path
         self.file_label.config(text=os.path.basename(path), style="TLabel")
+        if not self.title_var.get().strip():
+            self.title_var.set(os.path.splitext(os.path.basename(path))[0])
+
+    def _fetch_video_title_async(self):
+        url = self.video_url_var.get().strip()
+        if not url or self.title_var.get().strip():
+            return  # 没填链接，或者标题已经有内容了（不覆盖用户自己填的/已经拿到的）
+
+        def worker():
+            try:
+                import yt_dlp
+                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                title = (info or {}).get("title", "")
+            except Exception:
+                title = ""  # 拿不到就算了，不当错误弹出来打扰用户，反正标题还能自己填
+            if title:
+                self.parent.after(0, lambda: self._apply_fetched_title(title))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_fetched_title(self, title):
+        if not self.title_var.get().strip():  # 双重检查：这段抓取的时间里用户可能已经自己填了
+            self.title_var.set(title)
 
     def _start(self):
         video_url = self.video_url_var.get().strip()
