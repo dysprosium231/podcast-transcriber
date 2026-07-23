@@ -671,6 +671,17 @@ REGROUP_MAX_CHARS = 110  # 滚动阅读页不像Buzz的视频字幕(42字符/单
 REGROUP_LONG_GAP_SECONDS = 1.5  # 实测847词里只有1处间隔超过这个数，基本都是真实停顿/转场
 REGROUP_MIN_CHARS_FOR_GAP_SPLIT = 20  # 停顿再长，攒的内容太短也不当句子边界，避免切出残句
 
+# 只看"最后一个字符是不是句末标点"这个简单规则，会把常见缩写后面的句点误判成句子结束
+# （比如"Mr. Trump"从Mr.这里就断了）——Buzz自己的正则实现也有这个问题，不是我们独有的。
+# 加一个小黑名单缓解最常见的几种，不追求覆盖所有缩写（真做到需要完整的NLP分句器，这里
+# 只是新闻播客里常见的那几类：称谓、国家代号、月份缩写）
+REGROUP_ABBREVIATIONS = {
+    "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "st.",
+    "gen.", "sen.", "rep.", "gov.", "pres.",
+    "u.s.", "u.k.", "u.n.", "e.g.", "i.e.", "vs.", "etc.", "no.", "vol.",
+    "jan.", "feb.", "mar.", "apr.", "jun.", "jul.", "aug.", "sep.", "sept.", "oct.", "nov.", "dec.",
+}
+
 
 def regroup_words_into_sentences(segments, is_zh):
     """把transcribe_audio()产出的词级数据，按真实句子边界重新分组，替换掉Whisper自己那些从
@@ -703,14 +714,21 @@ def regroup_words_into_sentences(segments, is_zh):
         })
 
     for i, w in enumerate(words):
+        # whisper有些复合词会拆成两个token，第二个没有前导空格、是直接接在上一个词后面的
+        # 延续（比如"so"和"-called"两个token拼成"so-called"）——不是这个词是不是新句子的
+        # 信号，只是"这个token算不算一个真正的新词开头"。长停顿兜底/超长兜底都只能在真正
+        # 新词开头处断，不然会像这次实测(Sinica那期)踩到的一样，把"so-called"从中间切成
+        # "...these so" / "-called low-altitude..."两行，肉眼可见地断错地方
+        is_real_word_start = w["w"].startswith(" ") or is_zh
         gap = w["s"] - words[i - 1]["e"] if i > 0 else 0.0
-        if (
-            current_words
-            and gap > REGROUP_LONG_GAP_SECONDS
-            and len(current_text.strip()) >= REGROUP_MIN_CHARS_FOR_GAP_SPLIT
-        ):
-            flush()
-            current_words, current_text = [], ""
+
+        if current_words and is_real_word_start:
+            if (
+                gap > REGROUP_LONG_GAP_SECONDS
+                and len(current_text.strip()) >= REGROUP_MIN_CHARS_FOR_GAP_SPLIT
+            ) or len(current_text.strip()) >= REGROUP_MAX_CHARS:
+                flush()
+                current_words, current_text = [], ""
 
         current_words.append(w)
         # w["w"]是whisper自己给出的token，英文本来就带前导空格（" Why"/" get"这样），
@@ -718,10 +736,13 @@ def regroup_words_into_sentences(segments, is_zh):
         current_text += w["w"]
 
         stripped = w["w"].strip()
-        ends_sentence = bool(stripped) and stripped[-1] in REGROUP_SENTENCE_END_CHARS
-        too_long = len(current_text.strip()) >= REGROUP_MAX_CHARS
+        ends_sentence = (
+            bool(stripped)
+            and stripped[-1] in REGROUP_SENTENCE_END_CHARS
+            and stripped.lower() not in REGROUP_ABBREVIATIONS
+        )
 
-        if ends_sentence or too_long:
+        if ends_sentence:
             flush()
             current_words, current_text = [], ""
 
