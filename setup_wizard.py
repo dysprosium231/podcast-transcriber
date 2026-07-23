@@ -653,6 +653,7 @@ class SetupWizard:
         config = load_existing_config()
         self._populate_feeds(config.get("feeds", {}))
         self._populate_translation(config.get("translation", {}))
+        self.summary_enabled_var.set(config.get("enable_summary", True))
         self.whisper_prompt_text.delete("1.0", "end")
         self.whisper_prompt_text.insert("1.0", config.get("whisper_initial_prompt", WHISPER_INITIAL_PROMPT_DEFAULT))
         self.model_size_var.set(config.get("whisper_model_size", "large-v3"))
@@ -774,6 +775,19 @@ class SetupWizard:
         self.extra_prompt_text = tk.Text(frame, height=3, width=70, font=("Segoe UI", 10))
         style_text_widget(self.extra_prompt_text)
         self.extra_prompt_text.pack(padx=10, pady=(4, 10))
+
+        summary_row = ttk.Frame(frame)
+        summary_row.pack(fill="x", padx=10, pady=(0, 4))
+        self.summary_enabled_var = tk.BooleanVar(value=True)
+        make_checkmark_toggle(summary_row, "生成AI摘要（本期要点）", self.summary_enabled_var).pack(side="left")
+        ttk.Label(
+            frame, style="Muted.TLabel", wraplength=680, justify="left",
+            text="转录+翻译完之后，把全文喂给上面这个翻译服务（复用同一个API Key/模型，不用"
+                 "单独配置），额外生成3-6条中文要点，写进 summary.txt，也会显示在字幕页顶部。"
+                 "优先用中文译文总结，没有译文（源语言本来就是中文，或者翻译失败）的话直接"
+                 "用原文总结，模型本身能处理跨语言总结，不强依赖翻译先成功。生成失败不影响"
+                 "转录/翻译本身，只是没有这个摘要。",
+        ).pack(anchor="w", padx=10, pady=(0, 10))
 
     def _on_preset_selected(self, _event=None):
         preset = TRANSLATION_PRESETS.get(self.preset_var.get())
@@ -1225,6 +1239,7 @@ class SetupWizard:
             "language": LANGUAGE_VALUES_BY_LABEL.get(self.language_var.get(), "auto"),
             "enable_diarization": self.diarization_enabled_var.get(),
             "diarization_num_speakers": num_speakers,
+            "enable_summary": self.summary_enabled_var.get(),
             "ytdlp_cookies_browser": YTDLP_COOKIES_VALUES_BY_LABEL.get(self.ytdlp_cookies_var.get(), ""),
             "python_exe": self.python_exe_var.get().strip(),
             "translation": {

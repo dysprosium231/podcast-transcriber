@@ -9,6 +9,7 @@
   "transcribe_engine": "whisper",
   "enable_diarization": false,
   "diarization_num_speakers": -1,
+  "enable_summary": true,
   "ytdlp_cookies_browser": "",
   "translation": {
     "provider_name": "DeepSeek",

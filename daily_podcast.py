@@ -5,6 +5,7 @@ import sys
 import re
 import time
 import json
+import html
 import ctypes
 import shutil
 import zipfile
@@ -97,6 +98,11 @@ SENSEVOICE_MODEL_FILES = [
 # 的ONNX转换版 + 3D-Speaker声纹embedding模型
 ENABLE_DIARIZATION = CONFIG.get("enable_diarization", False)
 DIARIZATION_NUM_SPEAKERS = CONFIG.get("diarization_num_speakers", -1)  # -1表示自动判断说话人数
+
+# AI摘要（可选，默认开）：复用翻译那一套OpenAI兼容客户端/模型/API Key，不用单独配置、
+# 不引入新依赖。参考了buzz的ai_summary插件思路，但buzz是另起一个独立的OpenAI客户端，
+# 我们这边已经有配置好的translation_client，直接复用更省事
+ENABLE_SUMMARY = CONFIG.get("enable_summary", True)
 
 # 可选：yt-dlp下载视频链接时带上指定浏览器里已登录的cookies，伪装成真实登录用户请求，
 # 能明显缓解YouTube的"Sign in to confirm you're not a bot"拦截（不保证100%有效，且要求
@@ -815,6 +821,56 @@ def translate_segments(segments, on_progress=None):
     return segments
 
 
+SUMMARY_SYSTEM_PROMPT = (
+    "你是专业的新闻播客编辑。请把下面的播客文字稿总结成3-6条简洁要点，帮助读者不听完整期"
+    "就能判断这一期讲了什么、值不值得听——只提炼核心信息和结论，不要逐句复述细节，不要"
+    "添加要点列表之外的任何说明。用中文输出，每条要点独立一行。"
+)
+SUMMARY_TIMEOUT_SECONDS = 90  # 一次性把全文喂进去，通常比单批翻译请求慢，超时给宽一点
+SUMMARY_MAX_RETRIES = 2  # 跟翻译保持一致的重试次数
+# 防止极端长音频（没剪辑过的一两个小时节目）的转写全文把请求撑爆——这个上限本身很宽松，
+# 真正触发截断的情况应该很少见，是兜底不是常规路径
+SUMMARY_MAX_INPUT_CHARS = 40000
+
+
+def summarize_episode(segments):
+    """把这一期转录内容整理成一段话，喂给LLM生成"本期要点"，复用translate_segments()已经
+    配置好的translation_client/TRANSLATION_MODEL，不用单独起一个客户端（跟参考的buzz的
+    ai_summary插件不一样，它是另起一个独立OpenAI客户端）。中文源用zh字段（本来就是最终
+    展示语言），非中文源用翻译后的zh（没翻译成功的话退回en，保证空段落也有内容可总结）。
+    失败/没内容的话返回空字符串，不阻断主流程——空字符串会让调用方跳过写summary.txt和
+    在字幕页显示"本期要点"这个区块，不是報错"""
+    full_text = "\n".join(
+        (seg.get("zh") or seg.get("en") or "").strip()
+        for seg in segments
+        if seg.get("zh") or seg.get("en")
+    )
+    full_text = full_text.strip()
+    if not full_text:
+        return ""
+    if len(full_text) > SUMMARY_MAX_INPUT_CHARS:
+        full_text = full_text[:SUMMARY_MAX_INPUT_CHARS]
+
+    for attempt in range(SUMMARY_MAX_RETRIES + 1):
+        try:
+            response = translation_client.chat.completions.create(
+                model=TRANSLATION_MODEL,
+                messages=[
+                    {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                    {"role": "user", "content": full_text},
+                ],
+                timeout=SUMMARY_TIMEOUT_SECONDS,
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception as e:
+            print(f"Summary generation failed (attempt {attempt + 1}): {e}")
+            if attempt < SUMMARY_MAX_RETRIES:
+                time.sleep(5)
+
+    print(f"Summary generation gave up after {SUMMARY_MAX_RETRIES + 1} attempts")
+    return ""
+
+
 def save_episode_meta(meta, episode_dir):
     """存一份期数元数据（发布时间等），播客库列表要靠这个按时间排序/分组显示——RSS的
     itunes:episode（真正的"第几期"编号）几乎没有播客在用（实测两个真实feed都没有），
@@ -871,8 +927,9 @@ def generate_vtt(segments, output_path):
             f.write(f"{i}\n{start} --> {end}\n{_subtitle_cue_text(seg)}\n\n")
 
 
-def generate_html(title, audio_filename, segments, output_path):
-    """生成带音频播放器的双语字幕滚动页面"""
+def generate_html(title, audio_filename, segments, output_path, summary=""):
+    """生成带音频播放器的双语字幕滚动页面。summary留空（没开AI摘要，或者生成失败）就不渲染
+    "本期要点"这个区块，不留空白占位"""
     data_json = json.dumps(segments, ensure_ascii=False)
 
     html_template = """<!DOCTYPE html>
@@ -901,12 +958,19 @@ def generate_html(title, audio_filename, segments, output_path):
   .w-active { background: #ffce54; }
   .en { color: #2b2b2b; font-size: 16px; line-height: 1.7; letter-spacing: 0.1px; }
   .zh { color: #666; font-size: 15px; line-height: 1.9; margin-top: 8px; letter-spacing: 0.3px; }
+  #summary-box {
+    background: #fff; border: 1px solid #e5e5e5; border-radius: 10px;
+    padding: 14px 18px; margin-top: 10px; font-size: 14px; line-height: 1.8; color: #444;
+    white-space: pre-wrap;
+  }
+  #summary-box b { color: #222; font-size: 13px; display: block; margin-bottom: 6px; }
 </style>
 </head>
 <body>
   <div id="sticky-header">
     <h1>__TITLE__</h1>
     <audio id="audio" controls src="__AUDIO_FILENAME__"></audio>
+    __SUMMARY_HTML__
   </div>
   <div id="transcript"></div>
 
@@ -999,10 +1063,22 @@ audio.addEventListener("timeupdate", () => {
 </html>
 """
 
+    if summary.strip():
+        # 按行转义再拼<br>，而不是把整段文本一次性丢进textContent——摘要本来就是要点列表，
+        # 保留LLM输出的换行分行展示比挤成一段可读性好很多
+        escaped_lines = [html.escape(line) for line in summary.strip().splitlines()]
+        summary_html = (
+            '<div id="summary-box"><b>本期要点（AI生成，不保证100%准确）</b>'
+            + "<br>".join(escaped_lines) + "</div>"
+        )
+    else:
+        summary_html = ""
+
     html_content = (
         html_template
         .replace("__TITLE__", title)
         .replace("__AUDIO_FILENAME__", audio_filename)
+        .replace("__SUMMARY_HTML__", summary_html)
         .replace("__DATA_JSON__", data_json)
     )
 
@@ -1459,6 +1535,7 @@ def main():
         zh_txt_path = os.path.join(episode_dir, "transcript_zh.txt")
         srt_path = os.path.join(episode_dir, "subtitles.srt")
         vtt_path = os.path.join(episode_dir, "subtitles.vtt")
+        summary_path = os.path.join(episode_dir, "summary.txt")
 
         progress = FloatingProgress(f"「{show_name}」{current_title}")
 
@@ -1502,11 +1579,19 @@ def main():
                     # 说话人分离失败不阻断主流程，就当没开这个功能，正常出转录+翻译结果
                     print(f"Speaker diarization failed, skipping: {e}")
 
+            summary = ""
+            if ENABLE_SUMMARY:
+                progress.update("生成AI摘要...", 0.97)
+                summary = summarize_episode(segments)  # 失败/没开都返回""，不阻断主流程
+
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(segments, f, ensure_ascii=False, indent=2)
 
             save_text_files(segments, en_txt_path, zh_txt_path)
-            generate_html(current_title, audio_filename, segments, html_path)
+            if summary:
+                with open(summary_path, "w", encoding="utf-8") as f:
+                    f.write(summary)
+            generate_html(current_title, audio_filename, segments, html_path, summary=summary)
             generate_srt(segments, srt_path)
             generate_vtt(segments, vtt_path)
             save_episode_meta(
@@ -1516,6 +1601,7 @@ def main():
                     "language": detected_lang,
                     "engine": TRANSCRIBE_ENGINE,
                     "diarization": diarization_used,
+                    "summary": bool(summary),
                 },
                 episode_dir,
             )
@@ -1639,6 +1725,11 @@ def run_manual_job(show_name, episode_title, source_type, source, published="", 
         except Exception as e:
             print(f"Speaker diarization failed, skipping: {e}")
 
+    summary = ""
+    if ENABLE_SUMMARY:
+        _emit_json({"stage": "生成AI摘要...", "progress": 0.97})
+        summary = summarize_episode(segments)
+
     with open(os.path.join(episode_dir, "data.json"), "w", encoding="utf-8") as f:
         json.dump(segments, f, ensure_ascii=False, indent=2)
     save_text_files(
@@ -1646,7 +1737,10 @@ def run_manual_job(show_name, episode_title, source_type, source, published="", 
         os.path.join(episode_dir, "transcript_en.txt"),
         os.path.join(episode_dir, "transcript_zh.txt"),
     )
-    generate_html(episode_title, audio_filename, segments, os.path.join(episode_dir, "subtitles.html"))
+    if summary:
+        with open(os.path.join(episode_dir, "summary.txt"), "w", encoding="utf-8") as f:
+            f.write(summary)
+    generate_html(episode_title, audio_filename, segments, os.path.join(episode_dir, "subtitles.html"), summary=summary)
     generate_srt(segments, os.path.join(episode_dir, "subtitles.srt"))
     generate_vtt(segments, os.path.join(episode_dir, "subtitles.vtt"))
     save_episode_meta(
@@ -1656,6 +1750,7 @@ def run_manual_job(show_name, episode_title, source_type, source, published="", 
             "language": detected_lang,
             "engine": engine,
             "diarization": diarization_used,
+            "summary": bool(summary),
         },
         episode_dir,
     )
