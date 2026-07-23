@@ -661,6 +661,74 @@ def transcribe_audio(model, audio_path, language="auto", on_progress=None):
     return result, detected_lang
 
 
+# Whisper的segment边界经常从句子中间断开（VAD切分/解码窗口决定的，不是按语义），词级时间戳
+# 打开时(word_timestamps=True)才有机会重新按真实句子边界分组。规则实测过（真实6分钟新闻播客、
+# 847个词）：句末标点后的间隔中位数只有0.6秒、10分位数只有0.24秒，句中间隔99%分位数也只有
+# 0.46秒——两类间隔分布严重重叠，单靠间隔阈值切不出可靠边界，标点必须是主要依据，间隔只能当
+# 兜底（且要求已经攒了一定长度，避免把正常语速停顿处硬切开）
+REGROUP_SENTENCE_END_CHARS = set(".?!。？！")
+REGROUP_MAX_CHARS = 110  # 滚动阅读页不像Buzz的视频字幕(42字符/单屏)那么苛刻，可以放宽
+REGROUP_LONG_GAP_SECONDS = 1.5  # 实测847词里只有1处间隔超过这个数，基本都是真实停顿/转场
+REGROUP_MIN_CHARS_FOR_GAP_SPLIT = 20  # 停顿再长，攒的内容太短也不当句子边界，避免切出残句
+
+
+def regroup_words_into_sentences(segments, is_zh):
+    """把transcribe_audio()产出的词级数据，按真实句子边界重新分组，替换掉Whisper自己那些从
+    句子中间断开的segment。SenseVoice没有词级时间戳（segments里没有"words"字段），原样返回，
+    不生效——这个函数只对Whisper引擎起作用。
+
+    单趟前向累加：逐词加入当前句，遇到句末标点/超长/长停顿兜底就收尾，不是"先按间隔切、
+    再按标点切"这种多趟独立操作叠加——避免几条规则互相打架，边界优先级更好控制。"""
+    words = []
+    for seg in segments:
+        if seg.get("words"):
+            words.extend(seg["words"])
+    if not words:
+        return segments
+
+    result = []
+    current_words = []
+    current_text = ""
+
+    def flush():
+        if not current_words:
+            return
+        text = current_text.strip()
+        result.append({
+            "start": current_words[0]["s"],
+            "end": current_words[-1]["e"],
+            "en": "" if is_zh else text,
+            "zh": text if is_zh else "",
+            "words": current_words,
+        })
+
+    for i, w in enumerate(words):
+        gap = w["s"] - words[i - 1]["e"] if i > 0 else 0.0
+        if (
+            current_words
+            and gap > REGROUP_LONG_GAP_SECONDS
+            and len(current_text.strip()) >= REGROUP_MIN_CHARS_FOR_GAP_SPLIT
+        ):
+            flush()
+            current_words, current_text = [], ""
+
+        current_words.append(w)
+        # w["w"]是whisper自己给出的token，英文本来就带前导空格（" Why"/" get"这样），
+        # 拼接不用再插分隔符，插了反而重复空格；中文token一般不带前导空格，也不需要分隔符
+        current_text += w["w"]
+
+        stripped = w["w"].strip()
+        ends_sentence = bool(stripped) and stripped[-1] in REGROUP_SENTENCE_END_CHARS
+        too_long = len(current_text.strip()) >= REGROUP_MAX_CHARS
+
+        if ends_sentence or too_long:
+            flush()
+            current_words, current_text = [], ""
+
+    flush()
+    return result
+
+
 TRANSLATION_BASE_SYSTEM_PROMPT = (
     "你是专业的新闻播客翻译。下面是带编号的英文字幕行，请将每一行翻译成通顺准确的中文，"
     "严格按照相同的编号格式逐行返回翻译结果，不要合并或拆分行，不要添加编号之外的任何说明。"
@@ -1381,6 +1449,9 @@ def main():
                 TRANSCRIBE_ENGINE, session, audio_path, language=LANGUAGE,
                 on_progress=lambda p: progress.update(f"转录中 {int(p*100)}%", 0.2 + p * 0.6),
             )
+            # 必须在翻译之前做：按真实句子边界重组之后再翻译，送进去的是完整句子，
+            # 译文质量跟着改善（不用再被迫把Whisper断在句子中间的残句硬翻完整）
+            segments = regroup_words_into_sentences(segments, is_zh=(detected_lang == "zh"))
 
             if detected_lang == "zh":
                 progress.update("识别到中文，跳过翻译", 0.85)
@@ -1519,6 +1590,7 @@ def run_manual_job(show_name, episode_title, source_type, source, published="", 
         engine, session, audio_dest, language=language,
         on_progress=lambda p: _emit_json({"stage": f"转录中 {int(p * 100)}%", "progress": 0.2 + p * 0.6}),
     )
+    segments = regroup_words_into_sentences(segments, is_zh=(detected_lang == "zh"))
     if detected_lang == "zh":
         _emit_json({"stage": "识别到中文，跳过翻译", "progress": 0.85})
     else:
