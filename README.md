@@ -176,6 +176,8 @@ python setup_wizard.py
     "节目显示名": "RSS地址"
   },
   "whisper_model_size": "large-v3",   // 对应 models/ 下的文件夹名，只在transcribe_engine是whisper时用到
+  "whisper_initial_prompt": "...",    // 可选：给Whisper一个内容背景提示，缓解人名/机构名瞎猜拼写的问题，
+                                       // 只影响开头一小段的解码上下文，不是全程生效；只对whisper引擎有效
   "transcribe_engine": "whisper",     // "whisper" 或 "sensevoice"
   "language": "auto",                 // "auto"/"en"/"zh"，只支持这两种语言+自动识别
   "enable_diarization": false,        // 是否启用说话人区分

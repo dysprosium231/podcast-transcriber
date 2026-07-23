@@ -79,6 +79,13 @@ WHISPER_MODEL_CHOICES = [
     "medium", "medium.en", "large-v2", "large-v3", "distil-large-v3",
 ]
 
+# 跟daily_podcast.py里WHISPER_INITIAL_PROMPT的默认值保持一致，config.json没这个字段时两边
+# 应该显示/使用同一句话
+WHISPER_INITIAL_PROMPT_DEFAULT = (
+    "This is a news and current affairs podcast. It may include names of international "
+    "political, military, and public figures."
+)
+
 # 只支持中英两种语言+自动识别；配置文件里存value（"auto"/"en"/"zh"），下拉框显示label
 LANGUAGE_LABELS = {"auto": "自动识别（推荐）", "en": "英文", "zh": "中文"}
 LANGUAGE_VALUES_BY_LABEL = {v: k for k, v in LANGUAGE_LABELS.items()}
@@ -646,6 +653,8 @@ class SetupWizard:
         config = load_existing_config()
         self._populate_feeds(config.get("feeds", {}))
         self._populate_translation(config.get("translation", {}))
+        self.whisper_prompt_text.delete("1.0", "end")
+        self.whisper_prompt_text.insert("1.0", config.get("whisper_initial_prompt", WHISPER_INITIAL_PROMPT_DEFAULT))
         self.model_size_var.set(config.get("whisper_model_size", "large-v3"))
         self._refresh_model_status()
         self._refresh_sensevoice_status()
@@ -808,6 +817,18 @@ class SetupWizard:
                  "选SenseVoice；转录以英文为主、追求最佳准确率就用Whisper。\n"
                  "只支持中文/英文两种语言。自动识别是转录时顺带判断的，不额外花时间；"
                  "源音频语言比较确定的话手动指定能避免偶尔识别错。识别为中文时会自动跳过翻译这一步。",
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+        ttk.Label(frame, text="Whisper提示词（可选，只对Whisper引擎生效）").pack(anchor="w", padx=10)
+        self.whisper_prompt_text = tk.Text(frame, height=2, width=70, font=("Segoe UI", 10))
+        style_text_widget(self.whisper_prompt_text)
+        self.whisper_prompt_text.pack(padx=10, pady=(4, 4))
+        ttk.Label(
+            frame, style="Muted.TLabel", wraplength=680, justify="left",
+            text="给Whisper一个内容背景提示，实测能缓解人名/机构名瞎猜拼写的问题（比如把Zelensky"
+                 "认成形近的错误拼写）。只影响音频最开头一段的解码上下文，不是全程生效，也不能"
+                 "根治偶发的幻觉文本（比如凭空冒出几个无意义的字符）。默认是一句适合新闻类播客"
+                 "的通用提示，不针对某一档节目；SenseVoice引擎不支持这个参数，留空/填了都没影响。",
         ).pack(anchor="w", padx=10, pady=(0, 10))
 
     def _build_model_section(self):
@@ -1199,6 +1220,7 @@ class SetupWizard:
         return {
             "feeds": feeds,
             "whisper_model_size": self.model_size_var.get(),
+            "whisper_initial_prompt": self.whisper_prompt_text.get("1.0", "end").strip(),
             "transcribe_engine": ENGINE_VALUES_BY_LABEL.get(self.engine_var.get(), "whisper"),
             "language": LANGUAGE_VALUES_BY_LABEL.get(self.language_var.get(), "auto"),
             "enable_diarization": self.diarization_enabled_var.get(),

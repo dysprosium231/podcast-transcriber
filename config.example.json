@@ -3,6 +3,7 @@
     "example_show": "https://example.com/rss/your-podcast-feed.xml"
   },
   "whisper_model_size": "large-v3",
+  "whisper_initial_prompt": "This is a news and current affairs podcast. It may include names of international political, military, and public figures.",
   "python_exe": "",
   "language": "auto",
   "transcribe_engine": "whisper",

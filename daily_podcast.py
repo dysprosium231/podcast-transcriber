@@ -70,6 +70,16 @@ LATEST_LOG = "latest_episodes.txt"
 
 LANGUAGE = CONFIG.get("language", "auto")  # "auto"/"en"/"zh"，只支持这两种语言+自动识别
 
+# 喂给Whisper的initial_prompt：只影响第一个30秒窗口的解码上下文，不是全程生效，但对国际
+# 新闻类播客常见的人名/机构名（比如Zelensky、Syrskyi这类不常见拼写）有实测帮助——没有提示
+# 的话Whisper遇到词表里没有、发音又不常见的词，容易按发音硬猜一个拼写相近但错误的词。
+# 默认给一个泛用的新闻播客提示，不针对某一档节目；想要更精确可以在config.json里自己改
+WHISPER_INITIAL_PROMPT = CONFIG.get(
+    "whisper_initial_prompt",
+    "This is a news and current affairs podcast. It may include names of international "
+    "political, military, and public figures.",
+)
+
 # 转录引擎："whisper"（默认，GPU跑，英文/口音更稳）或"sensevoice"（纯CPU，不需要GPU/CUDA，
 # 中文更快更准还自带标点，但英文鲁棒性不如whisper，见README里的对比说明）
 TRANSCRIBE_ENGINE = CONFIG.get("transcribe_engine", "whisper")
@@ -605,6 +615,7 @@ def transcribe_audio(model, audio_path, language="auto", on_progress=None):
         language=None if language == "auto" else language,
         batch_size=4,
         vad_filter=True,
+        initial_prompt=WHISPER_INITIAL_PROMPT or None,
     )
     detected_lang = language if language != "auto" else (info.language or "en")
     is_zh = detected_lang == "zh"
