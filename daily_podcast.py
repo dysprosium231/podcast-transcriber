@@ -616,6 +616,7 @@ def transcribe_audio(model, audio_path, language="auto", on_progress=None):
         batch_size=4,
         vad_filter=True,
         initial_prompt=WHISPER_INITIAL_PROMPT or None,
+        word_timestamps=True,  # 词级时间戳，给字幕页逐词高亮用；实测在batched管线上也正常产出
     )
     detected_lang = language if language != "auto" else (info.language or "en")
     is_zh = detected_lang == "zh"
@@ -627,12 +628,21 @@ def transcribe_audio(model, audio_path, language="auto", on_progress=None):
         last_end = 0
         for seg in segments:
             text = seg.text.strip()
-            result.append({
+            entry = {
                 "start": seg.start,
                 "end": seg.end,
                 "en": "" if is_zh else text,
                 "zh": text if is_zh else "",
-            })
+            }
+            # 词级时间戳只有Whisper引擎有（SenseVoice是按VAD段整段出文本，没有词边界）。
+            # 用短key（w/s/e）压JSON体积；这些词拼起来正好等于上面的text，对应的是"主行"
+            # 那一行（英文源就是en，中文源就是zh），字幕页拿它做逐词卡拉OK式高亮
+            if seg.words:
+                entry["words"] = [
+                    {"w": w.word, "s": round(w.start, 2), "e": round(w.end, 2)}
+                    for w in seg.words
+                ]
+            result.append(entry)
             bar.update(round(seg.end - last_end, 1))
             last_end = seg.end
 
@@ -793,6 +803,9 @@ def generate_html(title, audio_filename, segments, output_path):
   .line.active { background: #fff3cd; }
   .time { color: #aaa; font-size: 12px; margin-right: 8px; font-variant-numeric: tabular-nums; }
   .speaker { font-size: 12px; font-weight: 600; margin-right: 8px; }
+  /* 逐词高亮：整句用浅黄底(.line.active)标出当前句，当前正在念的那个词再叠一层更深的琥珀色 */
+  .w { border-radius: 3px; transition: background 0.1s; }
+  .w-active { background: #ffce54; }
   .en { color: #2b2b2b; font-size: 16px; line-height: 1.7; letter-spacing: 0.1px; }
   .zh { color: #666; font-size: 15px; line-height: 1.9; margin-top: 8px; letter-spacing: 0.3px; }
 </style>
@@ -834,27 +847,58 @@ segments.forEach((seg, i) => {
   const secondary = (seg.en && seg.zh) ? seg.zh : "";
   const speakerHtml = seg.speaker
     ? `<span class="speaker" style="color:${speakerColor(seg.speaker)}">${seg.speaker}</span>` : "";
+  // 有词级时间戳（Whisper引擎）就把主行拆成一个个<span>好逐词高亮；没有（SenseVoice，
+  // 或者旧数据）就照旧整行渲染，降级成只有整句高亮，不影响使用
+  let primaryHtml;
+  if (seg.words && seg.words.length) {
+    primaryHtml = seg.words.map((w, j) => `<span class="w" id="w-${i}-${j}">${w.w}</span>`).join("");
+  } else {
+    primaryHtml = primary;
+  }
   div.innerHTML = `<span class="time">${formatTime(seg.start)}</span>${speakerHtml}
-                    <div class="en">${primary}</div>
+                    <div class="en">${primaryHtml}</div>
                     <div class="zh">${secondary}</div>`;
   div.onclick = () => { audio.currentTime = seg.start; audio.play(); };
   transcript.appendChild(div);
 });
 
 let currentIndex = -1;
+let currentWordEl = null;
+function clearWord() {
+  if (currentWordEl) { currentWordEl.classList.remove("w-active"); currentWordEl = null; }
+}
 audio.addEventListener("timeupdate", () => {
   const t = audio.currentTime;
   const idx = segments.findIndex((seg, i) => {
     const next = segments[i + 1];
     return t >= seg.start && (!next || t < next.start);
   });
-  if (idx !== -1 && idx !== currentIndex) {
+  if (idx === -1) return;
+  if (idx !== currentIndex) {
     if (currentIndex !== -1) {
       document.getElementById("line-" + currentIndex).classList.remove("active");
     }
+    clearWord();  // 换句了，先清掉上一句里残留的词高亮
     document.getElementById("line-" + idx).classList.add("active");
     document.getElementById("line-" + idx).scrollIntoView({ behavior: "smooth", block: "center" });
     currentIndex = idx;
+  }
+  // 当前句里定位正在念的词：取"起始时间已经<=当前播放位置"的最后一个词。用这种"最后一个
+  // 已开始的词"而不是"落在[s,e)区间里的词"，是因为词与词之间可能有间隙、也可能出现零时长
+  // 的词（whisper偶尔给出s==e），区间判断会在这些位置漏高亮，这种判据不会
+  const seg = segments[idx];
+  if (seg.words && seg.words.length) {
+    let wj = -1;
+    for (let j = 0; j < seg.words.length; j++) {
+      if (seg.words[j].s <= t) wj = j; else break;
+    }
+    const wel = wj === -1 ? null : document.getElementById(`w-${idx}-${wj}`);
+    if (wel !== currentWordEl) {
+      clearWord();
+      if (wel) { wel.classList.add("w-active"); currentWordEl = wel; }
+    }
+  } else {
+    clearWord();
   }
 });
 </script>
