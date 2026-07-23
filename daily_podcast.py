@@ -667,7 +667,11 @@ def transcribe_audio(model, audio_path, language="auto", on_progress=None):
 # 0.46秒——两类间隔分布严重重叠，单靠间隔阈值切不出可靠边界，标点必须是主要依据，间隔只能当
 # 兜底（且要求已经攒了一定长度，避免把正常语速停顿处硬切开）
 REGROUP_SENTENCE_END_CHARS = set(".?!。？！")
-REGROUP_MAX_CHARS = 110  # 滚动阅读页不像Buzz的视频字幕(42字符/单屏)那么苛刻，可以放宽
+REGROUP_MAX_CHARS = 160  # 滚动阅读页是普通div，浏览器里长句自然换行，没有Buzz那种"必须塞进
+# 单屏视频字幕"的硬约束，不需要照抄它的42字符。而且regroup跑在翻译之前，切得越碎，喂给
+# DeepSeek的就越是残句、译文质量越受影响——所以这个上限应该尽量宽松，只用来兜底极端的
+# 长句，不是常规切分手段。实测关掉上限看自然句长分布（同一期访谈类节目）：中位数119字符、
+# 90分位163字符，160能让约九成句子完整过关，只截断极少数的长尾
 REGROUP_LONG_GAP_SECONDS = 1.5  # 实测847词里只有1处间隔超过这个数，基本都是真实停顿/转场
 REGROUP_MIN_CHARS_FOR_GAP_SPLIT = 20  # 停顿再长，攒的内容太短也不当句子边界，避免切出残句
 
